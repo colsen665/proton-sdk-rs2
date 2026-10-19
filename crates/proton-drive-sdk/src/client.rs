@@ -365,6 +365,24 @@ impl ProtonDriveClient {
 // getters
 impl ProtonDriveClient {
     /// Attach a runtime-specific experimental search provider.
+    /// Sets how many whole-file transfers may run at once in each direction (uploads and
+    /// downloads are limited separately). The default is
+    /// [`TransferQueue::DEFAULT_MAX_CONCURRENT_FILES`] (1). Block-level parallelism is unchanged.
+    ///
+    /// Call this while building the client, before cloning it or starting transfers: clones made
+    /// earlier keep the previous limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is zero.
+    ///
+    /// [`TransferQueue::DEFAULT_MAX_CONCURRENT_FILES`]: crate::node::transfer::TransferQueue::DEFAULT_MAX_CONCURRENT_FILES
+    pub fn with_max_concurrent_file_transfers(mut self, limit: usize) -> Self {
+        self.block_uploader.queue = self.block_uploader.queue.with_max_concurrent_files(limit);
+        self.block_downloader.queue = self.block_downloader.queue.with_max_concurrent_files(limit);
+        self
+    }
+
     pub fn with_search_service_provider(
         mut self,
         provider: Arc<dyn crate::search::SearchServiceProvider>,
@@ -1405,6 +1423,50 @@ fn generate_uid() -> String {
 fn retain_first_move_error(first_error: &mut Option<anyhow::Error>, result: NodeMoveResult) {
     if first_error.is_none() {
         *first_error = result.result.err();
+    }
+}
+
+#[cfg(test)]
+mod transfer_concurrency_tests {
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn file_transfer_limit_applies_to_uploads_and_downloads() {
+        let (client, _) = crate::test_support::client().await;
+        let client = client.with_max_concurrent_file_transfers(2);
+
+        for queue in [
+            &client.block_uploader().queue,
+            &client.block_downloader().queue,
+        ] {
+            let _first = queue.start_file().await.unwrap();
+            let _second = queue.start_file().await.unwrap();
+            assert!(queue.start_file().now_or_never().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn default_client_runs_one_file_transfer_per_direction() {
+        let (client, _) = crate::test_support::client().await;
+
+        let _upload = client.block_uploader().queue.start_file().await.unwrap();
+        assert!(
+            client
+                .block_uploader()
+                .queue
+                .start_file()
+                .now_or_never()
+                .is_none()
+        );
+        let _download = client.block_downloader().queue.start_file().await.unwrap();
+        assert!(
+            client
+                .block_downloader()
+                .queue
+                .start_file()
+                .now_or_never()
+                .is_none()
+        );
     }
 }
 
