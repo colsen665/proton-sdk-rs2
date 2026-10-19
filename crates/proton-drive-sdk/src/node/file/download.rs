@@ -136,57 +136,18 @@ impl FileDownloader {
 
     /// Claimed plaintext sizes of each block, required for seeking. Fails on older files that omit them.
     pub async fn claimed_block_sizes(&self) -> anyhow::Result<Vec<i32>> {
-        use crate::api::attr::ExtendedAttributes;
-        use crate::author::Author;
-        use crate::node::authorship::AuthorshipClaim;
-        use crate::node::file::FileOperations;
-
-        let secrets =
-            FileOperations::get_secrets(&self.client, self.revision_uid.node_uid.clone()).await?;
-        let resp = self
-            .client
-            .api()
-            .files()
-            .get_revisions(
-                self.revision_uid.node_uid.volume_id.clone(),
-                self.revision_uid.node_uid.link_id.clone(),
-            )
-            .await?;
-        let dto = resp
-            .revisions
-            .into_iter()
-            .find(|r| r.id == self.revision_uid.revision_id)
-            .ok_or_else(|| anyhow::anyhow!("revision not found"))?;
-        let metric_item =
-            crate::telemetry::MetricItem::from_revision(&self.revision_uid.node_uid, &dto);
-        let xattr_msg = dto
-            .extended_attributes
-            .ok_or_else(|| anyhow::anyhow!("revision has no claimed block sizes"))?;
-        let claim = AuthorshipClaim {
-            keys: vec![],
-            author: Author::ANONYMOUS,
-            key_retrieval_error_message: None,
-        };
-        let (bytes, _, _) = self
-            .client
-            .integrity_reporter()
-            .decrypt_message(
-                &self.client,
-                &metric_item,
-                "nodeExtendedAttributes",
-                &xattr_msg,
-                None,
-                [&secrets.base.key],
-                &claim,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let xattr: ExtendedAttributes = serde_json::from_slice(&bytes)?;
-        xattr
-            .common
-            .and_then(|c| c.block_sizes)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("revision has no claimed block sizes"))
+        let secrets = crate::node::file::FileOperations::get_secrets(
+            &self.client,
+            self.revision_uid.node_uid.clone(),
+        )
+        .await?;
+        crate::node::file::block_map::listed_claimed_block_sizes(
+            &self.client,
+            &self.revision_uid,
+            &secrets.base.key,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("revision has no claimed block sizes"))
     }
 
     /// Downloads `[offset, offset+length)` of plaintext using claimed block sizes.
@@ -194,44 +155,23 @@ impl FileDownloader {
     /// Each downloaded block's hash is checked, but a ranged read cannot verify the
     /// revision manifest signature, which covers all blocks. Use
     /// [`Self::download_to_stream`] for an authenticated full download.
+    ///
+    /// Each call builds a new [`crate::node::file::block_map::BlockMap`]. For many
+    /// reads of the same revision, build one with
+    /// [`ProtonDriveClient::get_block_map`] and use
+    /// [`ProtonDriveClient::download_block`].
     pub async fn download_range(
         &self,
         offset: u64,
         length: u64,
         output: &mut dyn std::io::Write,
     ) -> anyhow::Result<u64> {
-        let sizes = self.claimed_block_sizes().await?;
-        let download_state = Arc::new(
-            crate::node::revision::RevisionOperations::create_download_state(
-                &self.client,
-                self.revision_uid.clone(),
-                Box::new(|_| {}),
-            )
-            .await?,
-        );
-        let reader = crate::node::revision::RevisionOperations::open_for_reading(
-            &self.client,
-            download_state,
-            Box::new(|_| {}),
-        );
-        let mut cursor = 0u64;
-        let end = offset.saturating_add(length);
+        let map = self.client.get_block_map(self.revision_uid.clone()).await?;
         let mut written = 0u64;
-        for (i, size) in sizes.iter().enumerate() {
-            let block_start = cursor;
-            let block_end = cursor + *size as u64;
-            cursor = block_end;
-            if block_end <= offset {
-                continue;
-            }
-            if block_start >= end {
-                break;
-            }
-            let data = reader.download_block_at((i as i32) + 1).await?;
-            let slice_start = offset.saturating_sub(block_start) as usize;
-            let slice_end = (end.min(block_end) - block_start) as usize;
-            output.write_all(&data[slice_start..slice_end.min(data.len())])?;
-            written += (slice_end - slice_start) as u64;
+        for slice in map.blocks_for_range(offset, length)? {
+            let data = self.client.download_block(&map, slice.index).await?;
+            output.write_all(&data[slice.start as usize..slice.end as usize])?;
+            written += slice.end - slice.start;
         }
         Ok(written)
     }
