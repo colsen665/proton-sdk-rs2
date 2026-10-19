@@ -183,7 +183,9 @@ impl ProtonDriveClient {
                 .join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
 
         Self::from_http_clients(
-            reqwest_middleware::ClientBuilder::new(default_api_http_client).build(),
+            reqwest_middleware::ClientBuilder::new(default_api_http_client)
+                .with(crate::http::retry::DriveApiRetryMiddleware::default())
+                .build(),
             reqwest_middleware::ClientBuilder::new(storage_api_http_client).build(),
             default_api_base_address,
             storage_api_base_address,
@@ -273,7 +275,9 @@ impl ProtonDriveClient {
             reqwest::Url::parse(&api_base_url)?.join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
 
         Self::from_http_clients(
-            reqwest_middleware::ClientBuilder::new(default_api_http_client).build(),
+            reqwest_middleware::ClientBuilder::new(default_api_http_client)
+                .with(crate::http::retry::DriveApiRetryMiddleware::default())
+                .build(),
             reqwest_middleware::ClientBuilder::new(storage_api_http_client).build(),
             base_address.clone(),
             base_address,
