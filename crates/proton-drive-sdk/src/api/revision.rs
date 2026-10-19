@@ -73,7 +73,7 @@ pub struct RevisionDto {
     pub thumbnails: Option<Vec<ThumbnailDto>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RevisionConflict {
     #[serde(rename = "ConflictLinkID")]
     pub link_id: Option<LinkId>,

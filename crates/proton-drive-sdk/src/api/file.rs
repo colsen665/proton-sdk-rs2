@@ -36,7 +36,7 @@ pub struct FileCreationIdentifiers {
     pub revision_id: RevisionId,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct FileCreationRequest {
     #[serde(flatten)]
