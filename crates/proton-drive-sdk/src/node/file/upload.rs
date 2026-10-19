@@ -1,9 +1,10 @@
 use crate::client::ProtonDriveClient;
 use crate::meta::AdditionalMetadataProperty;
+use crate::node::NodeUid;
 use crate::node::download::ControllerState;
 use crate::node::draft::RevisionDraftProvider;
 use crate::node::photo::{PhotoUploadContext, PhotosFileUploadMetadata};
-use crate::node::revision::RevisionOperations;
+use crate::node::revision::{RevisionOperations, RevisionUid};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -37,6 +38,26 @@ fn upload_classes(size: i64, blocks: i32) -> (&'static str, &'static str) {
         "single"
     };
     (size_class, block_class)
+}
+
+/// Identifies the node and the revision that a completed upload committed.
+///
+/// For a new file, `node_uid` is the newly created file node; for a new revision of an
+/// existing file, it is that file's node. `revision_uid` is always the revision created
+/// by this upload, so a sync client can recognise its own revisions in the event stream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UploadResult {
+    pub node_uid: NodeUid,
+    pub revision_uid: RevisionUid,
+}
+
+impl UploadResult {
+    pub(crate) fn from_revision_uid(revision_uid: RevisionUid) -> Self {
+        Self {
+            node_uid: revision_uid.node_uid.clone(),
+            revision_uid,
+        }
+    }
 }
 
 pub struct UploadController {
@@ -126,12 +147,28 @@ impl FileUploader {
         self.photos = Some(PhotoUploadContext { metadata, hash_key });
     }
 
+    /// Uploads the content and commits the revision, returning the node's UID.
+    ///
+    /// Use [`Self::upload_from_stream_with_revision`] to also obtain the committed revision's UID.
     pub async fn upload_from_stream(
         &self,
         content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
         on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
-    ) -> anyhow::Result<crate::node::NodeUid> {
+    ) -> anyhow::Result<NodeUid> {
+        self.upload_from_stream_with_revision(content_stream, thumbnails, on_progress)
+            .await
+            .map(|result| result.node_uid)
+    }
+
+    /// Uploads the content and commits the revision, returning both the node's UID and the
+    /// UID of the revision created by this upload.
+    pub async fn upload_from_stream_with_revision(
+        &self,
+        content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
+        on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
+    ) -> anyhow::Result<UploadResult> {
         let active_started = Instant::now();
         let result = self
             .upload_from_stream_inner(content_stream, thumbnails, on_progress)
@@ -187,9 +224,9 @@ impl FileUploader {
         content_stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
         on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
-    ) -> anyhow::Result<crate::node::NodeUid> {
+    ) -> anyhow::Result<UploadResult> {
         let draft = self.revision_draft_provider.get_draft().await?;
-        let node_uid = draft.uid.node_uid.clone();
+        let result = UploadResult::from_revision_uid(draft.uid.clone());
 
         let on_progress_arc: Arc<dyn Fn(i64, i64) + Send + Sync> = Arc::from(on_progress);
 
@@ -218,13 +255,29 @@ impl FileUploader {
             )
             .await?;
         writer.commit().await?;
-        Ok(node_uid)
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::upload_classes;
+    use super::{UploadResult, upload_classes};
+    use crate::node::NodeUid;
+    use crate::node::revision::RevisionUid;
+    use crate::revision::RevisionId;
+
+    #[test]
+    fn upload_result_carries_draft_revision_and_its_node() {
+        let draft_uid = RevisionUid::new(
+            NodeUid::from_parts("volume", "file-link"),
+            RevisionId::new("new-revision".into()),
+        );
+
+        let result = UploadResult::from_revision_uid(draft_uid.clone());
+
+        assert_eq!(result.revision_uid, draft_uid);
+        assert_eq!(result.node_uid, NodeUid::from_parts("volume", "file-link"));
+    }
 
     #[test]
     fn upload_classification_matches_route_buckets() {
