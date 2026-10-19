@@ -1,3 +1,4 @@
+pub mod block_map;
 pub mod download;
 pub mod upload;
 

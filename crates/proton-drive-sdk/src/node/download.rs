@@ -1,11 +1,13 @@
-use crate::api::block::BlockListingRevisionDto;
+use crate::api::block::{BlockDto, BlockListingRevisionDto};
 use crate::client::ProtonDriveClient;
 use crate::node::revision::RevisionUid;
+use crate::node::thumbnail::ThumbnailType;
 use crate::node::transfer::TransferQueue;
-use crate::pgp::{PgpPrivateKey, PgpSessionKey};
+use crate::pgp::{PgpArmoredSignature, PgpPrivateKey, PgpSessionKey};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{debug, error, info};
+use proton_rpgp::AsPublicKeyRef;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -17,6 +19,70 @@ use tokio::sync::watch;
 
 pub const MIN_BLOCK_INDEX: i32 = 1;
 pub const DEFAULT_BLOCK_PAGE_SIZE: i32 = 10;
+
+/// Error message used when the block listing of a revision has a gap.
+pub const INCOMPLETE_FILE_CONTENTS_MESSAGE: &str = "File contents are incomplete";
+
+/// Lists every block of a revision by requesting pages from `fetch_page`.
+///
+/// `fetch_page(from_block_index, page_size)` must return the blocks whose index is
+/// at least `from_block_index`, at most `page_size` of them. The first request
+/// starts at [`MIN_BLOCK_INDEX`]; each following request starts after the highest
+/// index seen so far. Paging stops at the first empty page or at a page holding
+/// fewer than `page_size` blocks.
+///
+/// Each page is sorted by index, and the indices must be contiguous starting at
+/// [`MIN_BLOCK_INDEX`]. A missing or duplicate index fails with
+/// [`INCOMPLETE_FILE_CONTENTS_MESSAGE`]. This mirrors `RevisionReader.GetBlocksAsync`
+/// in the C# SDK, except that the last block is also checked.
+pub async fn list_all_blocks<F, Fut>(
+    page_size: i32,
+    mut fetch_page: F,
+) -> anyhow::Result<Vec<BlockDto>>
+where
+    F: FnMut(i32, i32) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<BlockDto>>>,
+{
+    anyhow::ensure!(
+        page_size > 0,
+        "block page size must be positive, got {page_size}"
+    );
+
+    let mut blocks: Vec<BlockDto> = Vec::new();
+    let mut next_expected_index = MIN_BLOCK_INDEX;
+
+    loop {
+        let mut page = fetch_page(next_expected_index, page_size).await?;
+        if page.is_empty() {
+            break;
+        }
+
+        let must_try_next_page = page.len() >= page_size as usize;
+        page.sort_by_key(|block| block.index);
+
+        for block in page {
+            if block.index != next_expected_index {
+                log::warn!(
+                    "Missing block #{} in revision block listing (got #{})",
+                    next_expected_index,
+                    block.index
+                );
+                anyhow::bail!(
+                    "{INCOMPLETE_FILE_CONTENTS_MESSAGE}: expected block #{next_expected_index}, got #{}",
+                    block.index
+                );
+            }
+            next_expected_index += 1;
+            blocks.push(block);
+        }
+
+        if !must_try_next_page {
+            break;
+        }
+    }
+
+    Ok(blocks)
+}
 
 pub const MAX_CONCURRENT_DOWNLOADS: usize = 5;
 pub const MAX_BUFFERED_DOWNLOAD_BLOCKS: usize = 10;
@@ -47,6 +113,67 @@ impl DataIntegrityException {
             message: message.into(),
         }
     }
+}
+
+/// Builds the revision manifest that the uploader signs: the SHA-256 digests of
+/// the encrypted thumbnails ordered by thumbnail type, followed by the SHA-256
+/// digests of the encrypted content blocks in index order.
+///
+/// Thumbnails of the same type keep their relative order. This matches the
+/// manifest built by `RevisionReader.ReadAsync` and `RevisionWriter` in the C# SDK.
+pub fn build_revision_manifest<'a>(
+    thumbnail_digests: impl IntoIterator<Item = (ThumbnailType, &'a [u8])>,
+    block_digests: impl IntoIterator<Item = &'a [u8]>,
+) -> Vec<u8> {
+    let mut thumbnails: Vec<_> = thumbnail_digests.into_iter().collect();
+    thumbnails.sort_by_key(|(thumbnail_type, _)| *thumbnail_type as u32);
+
+    let mut manifest = Vec::new();
+    for (_, digest) in thumbnails {
+        manifest.extend_from_slice(digest);
+    }
+    for digest in block_digests {
+        manifest.extend_from_slice(digest);
+    }
+    manifest
+}
+
+/// Verifies the detached armored manifest signature of a revision.
+///
+/// The upload side signs without a signature context, so none is required here.
+/// As in the C# SDK, every outcome other than a valid signature fails with
+/// [`CompletedDownloadManifestVerificationException`]: a missing signature, no
+/// verification keys, a signature by another key, or a manifest that differs
+/// from the signed one.
+pub fn verify_manifest_signature(
+    manifest: &[u8],
+    signature: Option<&PgpArmoredSignature>,
+    verification_keys: &[proton_rpgp::PublicKey],
+) -> Result<(), CompletedDownloadManifestVerificationException> {
+    let Some(signature) = signature.filter(|signature| !signature.0.is_empty()) else {
+        return Err(CompletedDownloadManifestVerificationException::new(
+            "Cannot verify the author uploaded this file: the revision is not signed",
+        ));
+    };
+    if verification_keys.is_empty() {
+        return Err(CompletedDownloadManifestVerificationException::new(
+            "Cannot verify the author uploaded this file: no verification keys",
+        ));
+    }
+
+    proton_rpgp::Verifier::default()
+        .with_verification_keys(verification_keys.iter())
+        .verify_detached(
+            manifest,
+            signature.0.as_bytes(),
+            proton_rpgp::DataEncoding::Armored,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            CompletedDownloadManifestVerificationException::new(format!(
+                "Cannot verify the author uploaded this file: {error}"
+            ))
+        })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -286,7 +413,7 @@ pub trait FileDownloader: Send + Sync {
 pub struct DownloadController {
     state_tx: watch::Sender<ControllerState>,
     pub completion: tokio::task::JoinHandle<anyhow::Result<()>>,
-    is_download_complete_with_verification_issue: std::sync::atomic::AtomicBool,
+    is_download_complete_with_verification_issue: Arc<std::sync::atomic::AtomicBool>,
     sdk_events: Arc<crate::events::SdkEvents>,
 }
 
@@ -313,10 +440,26 @@ impl DownloadController {
         completion: tokio::task::JoinHandle<anyhow::Result<()>>,
         sdk_events: Arc<crate::events::SdkEvents>,
     ) -> Self {
+        Self::with_verification_issue_flag(
+            state_tx,
+            completion,
+            sdk_events,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    /// Like [`Self::new`], with a flag the download task sets when the content was
+    /// fully written but the manifest signature could not be verified.
+    pub fn with_verification_issue_flag(
+        state_tx: watch::Sender<ControllerState>,
+        completion: tokio::task::JoinHandle<anyhow::Result<()>>,
+        sdk_events: Arc<crate::events::SdkEvents>,
+        is_download_complete_with_verification_issue: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Self {
             state_tx,
             completion,
-            is_download_complete_with_verification_issue: std::sync::atomic::AtomicBool::new(false),
+            is_download_complete_with_verification_issue,
             sdk_events,
         }
     }
@@ -360,6 +503,10 @@ impl RevisionReader {
         }
     }
 
+    /// Downloads, verifies and returns the next block, or `None` after the last one.
+    ///
+    /// Each block's hash is checked. The manifest signature is not; call
+    /// [`Self::verify_manifest`] after the last block to check it.
     pub async fn read_next_block(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
         let block_index = self.state.get_next_block_index_to_download();
         let total_blocks = self.state.revision_dto.blocks.len() as i32;
@@ -376,12 +523,13 @@ impl RevisionReader {
         let digest = self
             .client
             .block_downloader()
-            .download(
+            .download_verified(
                 &self.client,
                 self.state.uid.clone(),
                 block_index,
                 block_dto.bare_url.clone(),
                 block_dto.token.clone(),
+                &block_dto.hash_digest,
                 self.state.content_key.clone(),
                 &mut cursor,
             )
@@ -401,6 +549,12 @@ impl RevisionReader {
     ///
     /// The method downloads up to `MAX_CONCURRENT_DOWNLOADS` blocks simultaneously,
     /// buffers them, and writes them to the output stream in the correct order.
+    ///
+    /// Each block's hash is checked; a mismatch fails with [`DataIntegrityException`].
+    /// After the last block is written, the revision manifest signature is verified
+    /// (see [`Self::verify_manifest`]). A failure there returns
+    /// [`CompletedDownloadManifestVerificationException`] although all content has
+    /// already been written to `output`.
     pub async fn read_all_blocks_parallel<W: std::io::Write + Send + ?Sized>(
         &self,
         output: &mut W,
@@ -409,7 +563,7 @@ impl RevisionReader {
     ) -> anyhow::Result<()> {
         let total_blocks = self.state.revision_dto.blocks.len();
         if total_blocks == 0 {
-            return Ok(());
+            return self.verify_manifest().await;
         }
 
         let total_size = self.state.revision_dto.revision.size;
@@ -442,6 +596,7 @@ impl RevisionReader {
             let client = self.client.clone();
             let bare_url = block_dto.bare_url.clone();
             let token = block_dto.token.clone();
+            let expected_hash = block_dto.hash_digest.clone();
             let ck = content_key.clone();
             let revision_uid = self.state.uid.clone();
 
@@ -452,6 +607,7 @@ impl RevisionReader {
                     idx,
                     &bare_url,
                     &token,
+                    &expected_hash,
                     &ck,
                 )
                 .await
@@ -480,6 +636,7 @@ impl RevisionReader {
                     let client = self.client.clone();
                     let bare_url = block_dto.bare_url.clone();
                     let token = block_dto.token.clone();
+                    let expected_hash = block_dto.hash_digest.clone();
                     let ck = content_key.clone();
                     let revision_uid = self.state.uid.clone();
 
@@ -490,6 +647,7 @@ impl RevisionReader {
                             next_idx,
                             &bare_url,
                             &token,
+                            &expected_hash,
                             &ck,
                         )
                         .await
@@ -541,9 +699,70 @@ impl RevisionReader {
             total_blocks, bytes_written
         );
 
+        self.verify_manifest().await
+    }
+
+    /// Verifies the revision manifest signature over the blocks downloaded so far.
+    ///
+    /// The manifest is assembled with [`build_revision_manifest`] from the
+    /// revision's thumbnail hashes and the digests of the downloaded blocks. It can
+    /// only match once every block has been downloaded in order, so it fails with
+    /// [`CompletedDownloadManifestVerificationException`] if any block is missing.
+    /// Ranged and partial reads ([`Self::download_block_at`],
+    /// `FileDownloader::download_range`) cannot verify the manifest; they rely on
+    /// the per-block hash check only.
+    ///
+    /// The verification keys are the node key when the revision has no signature
+    /// email address, and the address keys of that email otherwise.
+    pub async fn verify_manifest(&self) -> anyhow::Result<()> {
+        let revision = &self.state.revision_dto.revision;
+        let block_digests = self.state.get_downloaded_block_digests();
+        if block_digests.len() != self.state.revision_dto.blocks.len() {
+            return Err(CompletedDownloadManifestVerificationException::new(format!(
+                "Cannot verify the author uploaded this file: {} of {} blocks downloaded",
+                block_digests.len(),
+                self.state.revision_dto.blocks.len()
+            ))
+            .into());
+        }
+
+        let manifest = build_revision_manifest(
+            revision
+                .thumbnails
+                .iter()
+                .flatten()
+                .map(|thumbnail| (thumbnail.r#type, thumbnail.hash_digest.as_slice())),
+            block_digests.iter().map(Vec::as_slice),
+        );
+
+        let verification_keys = match revision.signature_email_address.as_deref() {
+            None | Some("") => vec![self.state.node_key.0.as_public_key().clone()],
+            Some(email) => self
+                .client
+                .account()
+                .get_address_public_keys(email)
+                .await
+                .map_err(|e| e.context("Failed to get manifest verification keys"))?,
+        };
+
+        if let Err(error) = verify_manifest_signature(
+            &manifest,
+            revision.manifest_signature.as_ref(),
+            &verification_keys,
+        ) {
+            log::warn!(
+                "Manifest verification failed for revision \"{}\": {}",
+                self.state.uid,
+                error
+            );
+            return Err(error.into());
+        }
         Ok(())
     }
 
+    /// Downloads one block by index and checks its hash.
+    ///
+    /// A single block cannot be checked against the revision manifest signature.
     pub async fn download_block_at(&self, block_index: i32) -> anyhow::Result<Vec<u8>> {
         let total = self.state.revision_dto.blocks.len() as i32;
         if block_index < 1 || block_index > total {
@@ -556,6 +775,7 @@ impl RevisionReader {
             block_index,
             &block_dto.bare_url,
             &block_dto.token,
+            &block_dto.hash_digest,
             &self.state.content_key,
         )
         .await?;
@@ -569,22 +789,382 @@ impl RevisionReader {
         block_index: i32,
         bare_url: &str,
         token: &str,
+        expected_hash: &[u8],
         content_key: &PgpSessionKey,
     ) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
         let mut data = Vec::new();
         let digest = client
             .block_downloader()
-            .download(
+            .download_verified(
                 client,
                 revision_uid.clone(),
                 block_index,
                 bare_url.to_owned(),
                 token.to_owned(),
+                expected_hash,
                 content_key.clone(),
                 &mut data,
             )
             .await?;
 
         Ok((block_index, data, digest))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::CryptoGenerator;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    fn block(index: i32) -> BlockDto {
+        BlockDto {
+            index,
+            hash_digest: vec![index as u8],
+            bare_url: format!("https://storage.test/{index}"),
+            token: format!("token-{index}"),
+        }
+    }
+
+    /// Serves `indices` as a paged block listing and records each request.
+    struct FakeListing {
+        indices: Vec<i32>,
+        requests: std::sync::Mutex<Vec<(i32, i32)>>,
+    }
+
+    impl FakeListing {
+        fn new(indices: impl IntoIterator<Item = i32>) -> Self {
+            Self {
+                indices: indices.into_iter().collect(),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn page(&self, from: i32, size: i32) -> anyhow::Result<Vec<BlockDto>> {
+            self.requests.lock().unwrap().push((from, size));
+            Ok(self
+                .indices
+                .iter()
+                .copied()
+                .filter(|index| *index >= from)
+                .take(size as usize)
+                .map(block)
+                .collect())
+        }
+
+        fn requests(&self) -> Vec<(i32, i32)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn indices(blocks: &[BlockDto]) -> Vec<i32> {
+        blocks.iter().map(|block| block.index).collect()
+    }
+
+    #[tokio::test]
+    async fn listing_follows_pages_past_the_first_page() {
+        let listing = FakeListing::new(1..=25);
+
+        let blocks = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap();
+
+        assert_eq!(indices(&blocks), (1..=25).collect::<Vec<_>>());
+        assert_eq!(blocks[24].bare_url, "https://storage.test/25");
+        assert_eq!(listing.requests(), vec![(1, 10), (11, 10), (21, 10)]);
+    }
+
+    #[tokio::test]
+    async fn listing_stops_at_empty_page_after_exact_multiple() {
+        let listing = FakeListing::new(1..=20);
+
+        let blocks = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap();
+
+        assert_eq!(indices(&blocks), (1..=20).collect::<Vec<_>>());
+        assert_eq!(listing.requests(), vec![(1, 10), (11, 10), (21, 10)]);
+    }
+
+    #[tokio::test]
+    async fn listing_with_missing_index_is_incomplete() {
+        let listing = FakeListing::new((1..=25).filter(|index| *index != 14));
+
+        let error = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(INCOMPLETE_FILE_CONTENTS_MESSAGE),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_with_missing_last_index_is_incomplete() {
+        let listing = FakeListing::new([1, 2, 4]);
+
+        let error = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(INCOMPLETE_FILE_CONTENTS_MESSAGE),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_that_does_not_start_at_first_index_is_incomplete() {
+        let listing = FakeListing::new(2..=5);
+
+        assert!(
+            list_all_blocks(10, |from, size| listing.page(from, size))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_sorts_each_page_by_index() {
+        let pages = std::sync::Mutex::new(vec![vec![3, 1, 2], vec![5, 4]]);
+
+        let blocks = list_all_blocks(3, |_, _| {
+            let page = pages.lock().unwrap().remove(0);
+            async move { Ok(page.into_iter().map(block).collect()) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(indices(&blocks), vec![1, 2, 3, 4, 5]);
+        assert_eq!(blocks[0].token, "token-1");
+    }
+
+    #[tokio::test]
+    async fn listing_of_single_block_file_uses_one_request() {
+        let listing = FakeListing::new([1]);
+
+        let blocks = list_all_blocks(DEFAULT_BLOCK_PAGE_SIZE, |from, size| {
+            listing.page(from, size)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(indices(&blocks), vec![1]);
+        assert_eq!(listing.requests(), vec![(1, DEFAULT_BLOCK_PAGE_SIZE)]);
+    }
+
+    #[tokio::test]
+    async fn listing_of_empty_revision_has_no_blocks() {
+        let listing = FakeListing::new([]);
+
+        let blocks = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap();
+
+        assert!(blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn listing_propagates_page_errors() {
+        let error = list_all_blocks(10, |_, _| async { anyhow::bail!("network down") })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "network down");
+    }
+
+    fn digest(byte: u8) -> Vec<u8> {
+        vec![byte; 32]
+    }
+
+    fn public_key(key: &PgpPrivateKey) -> proton_rpgp::PublicKey {
+        key.0.as_public_key().clone()
+    }
+
+    #[test]
+    fn manifest_lists_thumbnails_by_type_then_blocks_in_order() {
+        let preview = digest(2);
+        let thumbnail = digest(1);
+        let blocks = [digest(10), digest(11), digest(12)];
+
+        let manifest = build_revision_manifest(
+            [
+                (ThumbnailType::Preview, preview.as_slice()),
+                (ThumbnailType::Thumbnail, thumbnail.as_slice()),
+            ],
+            blocks.iter().map(Vec::as_slice),
+        );
+
+        let expected: Vec<u8> = [thumbnail, preview, blocks[0].clone(), blocks[1].clone()]
+            .into_iter()
+            .chain([blocks[2].clone()])
+            .flatten()
+            .collect();
+        assert_eq!(manifest, expected);
+    }
+
+    #[test]
+    fn manifest_without_thumbnails_is_block_digests() {
+        let blocks = [digest(1), digest(2)];
+
+        let manifest = build_revision_manifest([], blocks.iter().map(Vec::as_slice));
+
+        assert_eq!(manifest, blocks.concat());
+    }
+
+    #[test]
+    fn manifest_signature_verifies_with_signing_key() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        let manifest = build_revision_manifest([], [digest(1).as_slice()]);
+        let signature = key.sign_detached_armored(&manifest).unwrap();
+
+        verify_manifest_signature(&manifest, Some(&signature), &[public_key(&key)]).unwrap();
+    }
+
+    #[test]
+    fn manifest_signature_fails_with_another_key() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        let other = CryptoGenerator::generate_private_key().unwrap();
+        let manifest = build_revision_manifest([], [digest(1).as_slice()]);
+        let signature = key.sign_detached_armored(&manifest).unwrap();
+
+        assert!(
+            verify_manifest_signature(&manifest, Some(&signature), &[public_key(&other)]).is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_signature_fails_for_tampered_manifest() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        let manifest = build_revision_manifest([], [digest(1).as_slice()]);
+        let signature = key.sign_detached_armored(&manifest).unwrap();
+        let tampered = build_revision_manifest([], [digest(2).as_slice()]);
+
+        assert!(
+            verify_manifest_signature(&tampered, Some(&signature), &[public_key(&key)]).is_err()
+        );
+    }
+
+    #[test]
+    fn unsigned_manifest_or_missing_keys_fail_verification() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        let manifest = build_revision_manifest([], [digest(1).as_slice()]);
+        let signature = key.sign_detached_armored(&manifest).unwrap();
+
+        assert!(verify_manifest_signature(&manifest, None, &[public_key(&key)]).is_err());
+        assert!(
+            verify_manifest_signature(
+                &manifest,
+                Some(&PgpArmoredSignature(String::new())),
+                &[public_key(&key)]
+            )
+            .is_err()
+        );
+        assert!(verify_manifest_signature(&manifest, Some(&signature), &[]).is_err());
+    }
+
+    /// A revision listing with one preview thumbnail and two blocks, signed by
+    /// `signer` the way `RevisionWriter::commit` signs it, without signature email.
+    fn signed_state(
+        node_key: &PgpPrivateKey,
+        signer: &PgpPrivateKey,
+        block_digests: &[Vec<u8>],
+    ) -> DownloadState {
+        let thumbnail_digest = digest(9);
+        let manifest = build_revision_manifest(
+            [(ThumbnailType::Preview, thumbnail_digest.as_slice())],
+            block_digests.iter().map(Vec::as_slice),
+        );
+        let signature = signer.sign_detached_armored(&manifest).unwrap();
+        let blocks: Vec<_> = block_digests
+            .iter()
+            .enumerate()
+            .map(|(i, digest)| {
+                serde_json::json!({
+                    "Index": i + 1,
+                    "Hash": STANDARD.encode(digest),
+                    "BareURL": format!("https://storage.test/{}", i + 1),
+                    "Token": "token",
+                })
+            })
+            .collect();
+        let dto: BlockListingRevisionDto = serde_json::from_value(serde_json::json!({
+            "ID": "revision",
+            "CreateTime": 1_700_000_000,
+            "Size": 10,
+            "ManifestSignature": signature.0,
+            "SignatureEmail": "",
+            "State": 1,
+            "Thumbnails": [{
+                "ThumbnailID": "thumbnail",
+                "Type": 2,
+                "Hash": STANDARD.encode(&thumbnail_digest),
+                "Size": 1,
+            }],
+            "Blocks": blocks,
+        }))
+        .unwrap();
+        assert_eq!(dto.blocks[1].hash_digest, block_digests[1]);
+        DownloadState::new(
+            RevisionUid::default(),
+            dto,
+            node_key.clone(),
+            CryptoGenerator::generate_session_key(),
+        )
+    }
+
+    async fn reader(state: DownloadState) -> RevisionReader {
+        let (client, _) = crate::test_support::client().await;
+        RevisionReader::new(Arc::new(client), Arc::new(state), Box::new(|_| {}))
+    }
+
+    #[tokio::test]
+    async fn completed_download_verifies_manifest_with_node_key() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let block_digests = [digest(1), digest(2)];
+        let state = signed_state(&node_key, &node_key, &block_digests);
+        for block_digest in &block_digests {
+            state.add_downloaded_block_digest(block_digest.clone());
+        }
+
+        reader(state).await.verify_manifest().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manifest_signed_by_another_key_is_a_verification_exception() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let other = CryptoGenerator::generate_private_key().unwrap();
+        let block_digests = [digest(1), digest(2)];
+        let state = signed_state(&node_key, &other, &block_digests);
+        for block_digest in &block_digests {
+            state.add_downloaded_block_digest(block_digest.clone());
+        }
+
+        let error = reader(state).await.verify_manifest().await.unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<CompletedDownloadManifestVerificationException>()
+                .is_some(),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_download_cannot_verify_manifest() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let block_digests = [digest(1), digest(2)];
+        let state = signed_state(&node_key, &node_key, &block_digests);
+        state.add_downloaded_block_digest(block_digests[0].clone());
+
+        let error = reader(state).await.verify_manifest().await.unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<CompletedDownloadManifestVerificationException>()
+                .is_some(),
+            "{error}"
+        );
     }
 }

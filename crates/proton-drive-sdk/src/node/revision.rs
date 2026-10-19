@@ -230,35 +230,70 @@ impl RevisionOperations {
             "Getting revision blocks for revision_id={}",
             revision_uid.revision_id.raw()
         );
-        let revision_response = client
-            .api()
-            .files()
-            .get_revision(
-                revision_uid.node_uid.volume_id.clone(),
-                revision_uid.node_uid.link_id.clone(),
-                revision_uid.revision_id.clone(),
-                Some(crate::node::download::MIN_BLOCK_INDEX),
-                Some(crate::node::download::DEFAULT_BLOCK_PAGE_SIZE),
-                false,
-            )
+        let revision = Self::get_revision_with_all_blocks(client, &revision_uid)
             .await
             .context("Failed to get revision from API")?;
 
         tracing::debug!(
             "Download state created for revision {:?}: {} blocks, size={}",
             revision_uid.revision_id,
-            revision_response.revision.blocks.len(),
-            revision_response.revision.revision.size
+            revision.blocks.len(),
+            revision.revision.size
         );
 
+        // One block-listing slot covers the whole listing, however many pages it took.
         release_block_listing_action(1);
 
         Ok(DownloadState::new(
             revision_uid,
-            revision_response.revision,
+            revision,
             secrets.base.key,
             secrets.content_key,
         ))
+    }
+
+    /// Fetches a revision together with its complete block list.
+    ///
+    /// The block list is requested page by page (see
+    /// [`crate::node::download::list_all_blocks`]), so revisions with more than
+    /// [`crate::node::download::DEFAULT_BLOCK_PAGE_SIZE`] blocks are listed in full.
+    /// The revision metadata is taken from the first page.
+    pub async fn get_revision_with_all_blocks(
+        client: &ProtonDriveClient,
+        revision_uid: &RevisionUid,
+    ) -> anyhow::Result<crate::api::block::BlockListingRevisionDto> {
+        let first_revision = std::sync::Mutex::new(None);
+        let blocks = crate::node::download::list_all_blocks(
+            crate::node::download::DEFAULT_BLOCK_PAGE_SIZE,
+            |from_block_index, page_size| {
+                let first_revision = &first_revision;
+                async move {
+                    let response = client
+                        .api()
+                        .files()
+                        .get_revision(
+                            revision_uid.node_uid.volume_id.clone(),
+                            revision_uid.node_uid.link_id.clone(),
+                            revision_uid.revision_id.clone(),
+                            Some(from_block_index),
+                            Some(page_size),
+                            false,
+                        )
+                        .await?;
+                    let crate::api::block::BlockListingRevisionDto { revision, blocks } =
+                        response.revision;
+                    first_revision.lock().unwrap().get_or_insert(revision);
+                    Ok(blocks)
+                }
+            },
+        )
+        .await?;
+
+        let revision = first_revision
+            .into_inner()
+            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("revision listing returned no revision"))?;
+        Ok(crate::api::block::BlockListingRevisionDto { revision, blocks })
     }
 
     pub fn open_for_reading(
@@ -284,7 +319,7 @@ pub struct RevisionWriter {
     block_number: i32,
     digests: Vec<u8>,
     block_sizes: Vec<i32>,
-    thumbnail_digests: Vec<u8>,
+    thumbnail_digests: Vec<(crate::node::thumbnail::ThumbnailType, Vec<u8>)>,
     sha1_hasher: sha1::Sha1,
     /// Pre-computed SHA1 hash from pipelined write (set by producer task)
     precomputed_sha1: Option<[u8; 20]>,
@@ -626,7 +661,7 @@ impl RevisionWriter {
                 )
                 .await?;
 
-            self.thumbnail_digests.extend_from_slice(&hash_digest);
+            self.thumbnail_digests.push((thumb_type, hash_digest));
         }
 
         Ok(())
@@ -644,9 +679,14 @@ impl RevisionWriter {
             block_sizes = ?self.block_sizes,
             "Committing revision"
         );
-        let mut manifest = Vec::with_capacity(self.thumbnail_digests.len() + self.digests.len());
-        manifest.extend_from_slice(&self.thumbnail_digests);
-        manifest.extend_from_slice(&self.digests);
+        // Thumbnail digests ordered by type, then block digests in index order, as
+        // the downloader rebuilds it in RevisionReader::verify_manifest.
+        let manifest = crate::node::download::build_revision_manifest(
+            self.thumbnail_digests
+                .iter()
+                .map(|(thumbnail_type, digest)| (*thumbnail_type, digest.as_slice())),
+            std::iter::once(self.digests.as_slice()),
+        );
         let manifest_signature = self.draft.signing_key.sign_detached_armored(&manifest)?;
 
         // Use precomputed SHA1 from pipelined write, or fall back to hasher
