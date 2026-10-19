@@ -17,7 +17,7 @@ use crate::users::{DefaultUsersApiClient, UsersApiClient};
 use crate::utils::AppVersionConfiguration;
 use crate::{
     PasswordMode, SessionId, UserId,
-    auth::{AuthenticationApiClient, TokenCredential},
+    auth::{AuthenticationApiClient, TokenCredential, TokenRefreshError},
     cache::CacheRepository,
     client::{ApiClient, ProtonApiDefaults, ProtonClientConfiguration, ProtonClientOptions},
     secret::DefaultSecretCache,
@@ -508,7 +508,7 @@ impl ProtonAPISession {
         )?;
 
         let probe_response = probe
-            .get("https://drive-api.proton.me/auth/v4/scopes")
+            .get(scopes_probe_url(&self.client_config.base_url)?)
             .send()
             .await?;
 
@@ -542,7 +542,19 @@ impl ProtonAPISession {
         let refreshed_access_token = self
             .token_credential
             .get_refreshed_access_token(access_token.clone())
-            .await?;
+            .await
+            .map_err(|error| {
+                let is_refresh_token_expired = error
+                    .downcast_ref::<TokenRefreshError>()
+                    .is_some_and(TokenRefreshError::is_refresh_token_expired);
+                if is_refresh_token_expired {
+                    error.context(
+                        "Session expired: the refresh token was rejected. Please re-authenticate.",
+                    )
+                } else {
+                    error
+                }
+            })?;
 
         if refreshed_access_token == access_token {
             anyhow::bail!(
@@ -639,6 +651,15 @@ impl ProtonAPISession {
     }
 }
 
+/// Returns the `auth/v4/scopes` URL under the configured API base URL.
+fn scopes_probe_url(base_url: &http::Uri) -> anyhow::Result<reqwest::Url> {
+    let mut base = base_url.to_string();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    Ok(reqwest::Url::parse(&base)?.join("auth/v4/scopes")?)
+}
+
 fn generate_sign_in_url(
     auth_client_id: &str,
     user_code: &str,
@@ -703,6 +724,21 @@ fn decrypt_fork_key_password(
 mod tests {
     use super::*;
     use aes_gcm::aead::Aead;
+
+    #[test]
+    fn scopes_probe_uses_the_configured_base_url() {
+        let default = scopes_probe_url(&ProtonApiDefaults::base_url()).unwrap();
+        assert_eq!(
+            default.as_str(),
+            "https://drive-api.proton.me/auth/v4/scopes"
+        );
+
+        let custom = scopes_probe_url(&"https://api.example.test/api".parse().unwrap()).unwrap();
+        assert_eq!(
+            custom.as_str(),
+            "https://api.example.test/api/auth/v4/scopes"
+        );
+    }
 
     #[test]
     fn fork_payload_roundtrip() {
