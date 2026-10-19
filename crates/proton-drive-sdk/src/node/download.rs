@@ -1,4 +1,4 @@
-use crate::api::block::BlockListingRevisionDto;
+use crate::api::block::{BlockDto, BlockListingRevisionDto};
 use crate::client::ProtonDriveClient;
 use crate::node::revision::RevisionUid;
 use crate::node::transfer::TransferQueue;
@@ -17,6 +17,70 @@ use tokio::sync::watch;
 
 pub const MIN_BLOCK_INDEX: i32 = 1;
 pub const DEFAULT_BLOCK_PAGE_SIZE: i32 = 10;
+
+/// Error message used when the block listing of a revision has a gap.
+pub const INCOMPLETE_FILE_CONTENTS_MESSAGE: &str = "File contents are incomplete";
+
+/// Lists every block of a revision by requesting pages from `fetch_page`.
+///
+/// `fetch_page(from_block_index, page_size)` must return the blocks whose index is
+/// at least `from_block_index`, at most `page_size` of them. The first request
+/// starts at [`MIN_BLOCK_INDEX`]; each following request starts after the highest
+/// index seen so far. Paging stops at the first empty page or at a page holding
+/// fewer than `page_size` blocks.
+///
+/// Each page is sorted by index, and the indices must be contiguous starting at
+/// [`MIN_BLOCK_INDEX`]. A missing or duplicate index fails with
+/// [`INCOMPLETE_FILE_CONTENTS_MESSAGE`]. This mirrors `RevisionReader.GetBlocksAsync`
+/// in the C# SDK, except that the last block is also checked.
+pub async fn list_all_blocks<F, Fut>(
+    page_size: i32,
+    mut fetch_page: F,
+) -> anyhow::Result<Vec<BlockDto>>
+where
+    F: FnMut(i32, i32) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<BlockDto>>>,
+{
+    anyhow::ensure!(
+        page_size > 0,
+        "block page size must be positive, got {page_size}"
+    );
+
+    let mut blocks: Vec<BlockDto> = Vec::new();
+    let mut next_expected_index = MIN_BLOCK_INDEX;
+
+    loop {
+        let mut page = fetch_page(next_expected_index, page_size).await?;
+        if page.is_empty() {
+            break;
+        }
+
+        let must_try_next_page = page.len() >= page_size as usize;
+        page.sort_by_key(|block| block.index);
+
+        for block in page {
+            if block.index != next_expected_index {
+                log::warn!(
+                    "Missing block #{} in revision block listing (got #{})",
+                    next_expected_index,
+                    block.index
+                );
+                anyhow::bail!(
+                    "{INCOMPLETE_FILE_CONTENTS_MESSAGE}: expected block #{next_expected_index}, got #{}",
+                    block.index
+                );
+            }
+            next_expected_index += 1;
+            blocks.push(block);
+        }
+
+        if !must_try_next_page {
+            break;
+        }
+    }
+
+    Ok(blocks)
+}
 
 pub const MAX_CONCURRENT_DOWNLOADS: usize = 5;
 pub const MAX_BUFFERED_DOWNLOAD_BLOCKS: usize = 10;
@@ -586,5 +650,167 @@ impl RevisionReader {
             .await?;
 
         Ok((block_index, data, digest))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(index: i32) -> BlockDto {
+        BlockDto {
+            index,
+            hash_digest: vec![index as u8],
+            bare_url: format!("https://storage.test/{index}"),
+            token: format!("token-{index}"),
+        }
+    }
+
+    /// Serves `indices` as a paged block listing and records each request.
+    struct FakeListing {
+        indices: Vec<i32>,
+        requests: std::sync::Mutex<Vec<(i32, i32)>>,
+    }
+
+    impl FakeListing {
+        fn new(indices: impl IntoIterator<Item = i32>) -> Self {
+            Self {
+                indices: indices.into_iter().collect(),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn page(&self, from: i32, size: i32) -> anyhow::Result<Vec<BlockDto>> {
+            self.requests.lock().unwrap().push((from, size));
+            Ok(self
+                .indices
+                .iter()
+                .copied()
+                .filter(|index| *index >= from)
+                .take(size as usize)
+                .map(block)
+                .collect())
+        }
+
+        fn requests(&self) -> Vec<(i32, i32)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn indices(blocks: &[BlockDto]) -> Vec<i32> {
+        blocks.iter().map(|block| block.index).collect()
+    }
+
+    #[tokio::test]
+    async fn listing_follows_pages_past_the_first_page() {
+        let listing = FakeListing::new(1..=25);
+
+        let blocks = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap();
+
+        assert_eq!(indices(&blocks), (1..=25).collect::<Vec<_>>());
+        assert_eq!(blocks[24].bare_url, "https://storage.test/25");
+        assert_eq!(listing.requests(), vec![(1, 10), (11, 10), (21, 10)]);
+    }
+
+    #[tokio::test]
+    async fn listing_stops_at_empty_page_after_exact_multiple() {
+        let listing = FakeListing::new(1..=20);
+
+        let blocks = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap();
+
+        assert_eq!(indices(&blocks), (1..=20).collect::<Vec<_>>());
+        assert_eq!(listing.requests(), vec![(1, 10), (11, 10), (21, 10)]);
+    }
+
+    #[tokio::test]
+    async fn listing_with_missing_index_is_incomplete() {
+        let listing = FakeListing::new((1..=25).filter(|index| *index != 14));
+
+        let error = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(INCOMPLETE_FILE_CONTENTS_MESSAGE),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_with_missing_last_index_is_incomplete() {
+        let listing = FakeListing::new([1, 2, 4]);
+
+        let error = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(INCOMPLETE_FILE_CONTENTS_MESSAGE),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_that_does_not_start_at_first_index_is_incomplete() {
+        let listing = FakeListing::new(2..=5);
+
+        assert!(
+            list_all_blocks(10, |from, size| listing.page(from, size))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_sorts_each_page_by_index() {
+        let pages = std::sync::Mutex::new(vec![vec![3, 1, 2], vec![5, 4]]);
+
+        let blocks = list_all_blocks(3, |_, _| {
+            let page = pages.lock().unwrap().remove(0);
+            async move { Ok(page.into_iter().map(block).collect()) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(indices(&blocks), vec![1, 2, 3, 4, 5]);
+        assert_eq!(blocks[0].token, "token-1");
+    }
+
+    #[tokio::test]
+    async fn listing_of_single_block_file_uses_one_request() {
+        let listing = FakeListing::new([1]);
+
+        let blocks = list_all_blocks(DEFAULT_BLOCK_PAGE_SIZE, |from, size| {
+            listing.page(from, size)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(indices(&blocks), vec![1]);
+        assert_eq!(listing.requests(), vec![(1, DEFAULT_BLOCK_PAGE_SIZE)]);
+    }
+
+    #[tokio::test]
+    async fn listing_of_empty_revision_has_no_blocks() {
+        let listing = FakeListing::new([]);
+
+        let blocks = list_all_blocks(10, |from, size| listing.page(from, size))
+            .await
+            .unwrap();
+
+        assert!(blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn listing_propagates_page_errors() {
+        let error = list_all_blocks(10, |_, _| async { anyhow::bail!("network down") })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "network down");
     }
 }
