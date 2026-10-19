@@ -191,22 +191,7 @@ impl FoldersApiClient for DefaultFoldersApiClient {
         let response = builder.send().await?;
 
         let text = response.text().await?;
-        let res: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            anyhow::anyhow!("Failed to decode response body: {}. Body: {}", e, text)
-        })?;
-
-        if let Some(code) = res.get("Code").and_then(|c| c.as_u64()) {
-            if code != 1000 {
-                let error = res
-                    .get("Error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("Unknown error");
-                anyhow::bail!("API error: code {}, message: {}", code, error);
-            }
-        }
-
-        let folder_creation_response: FolderCreationResponse = serde_json::from_value(res)?;
-        Ok(folder_creation_response)
+        super::parse_coded_json_body::<FolderCreationResponse>(&text)
     }
 
     async fn get_folder_size(
