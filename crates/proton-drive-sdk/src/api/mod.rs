@@ -12,6 +12,7 @@ pub mod storage;
 pub mod trash;
 pub mod volumes;
 
+use crate::error::ApiError;
 use proton_sdk_rs2::auth::TokenCredential;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::Deserialize;
@@ -223,25 +224,95 @@ impl ApiResponse {
         self.code.is_success()
     }
 
+    /// Converts a non-success response into a typed [`ApiError`].
     pub fn to_result(&self) -> anyhow::Result<()> {
         if self.is_success() {
             Ok(())
         } else {
-            anyhow::bail!(
-                "API error: code {}, message: {:?}",
-                self.code.0,
-                self.error_message
+            Err(
+                ApiError::from_code(self.code.0, self.error_message.clone().unwrap_or_default())
+                    .into(),
             )
         }
     }
 
     pub async fn from_response(response: reqwest::Response) -> anyhow::Result<Self> {
+        let status = response.status();
+        let headers = response.headers().clone();
         let text = response.text().await?;
-        let res: Self = serde_json::from_str(&text).map_err(|e| {
-            anyhow::anyhow!("Failed to decode response body: {}. Body: {}", e, text)
-        })?;
-        Ok(res)
+        match serde_json::from_str::<Self>(&text) {
+            Ok(res) => Ok(res),
+            Err(_) if !status.is_success() => {
+                Err(ApiError::from_http(status, &headers, &text).into())
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to decode response body: {}. Body: {}",
+                e,
+                text
+            )),
+        }
     }
+}
+
+/// Parses a Drive API response body as `T`.
+///
+/// A non-2xx status becomes an [`ApiError`] carrying the HTTP status, the
+/// Proton `Code`/`Error` from the body (when present) and `Retry-After`.
+pub(crate) async fn parse_json_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> anyhow::Result<T> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap_or_default();
+    parse_json_body(status, &headers, &body)
+}
+
+fn parse_json_body<T: serde::de::DeserializeOwned>(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> anyhow::Result<T> {
+    if !status.is_success() {
+        return Err(ApiError::from_http(status, headers, body).into());
+    }
+    serde_json::from_str::<T>(body).map_err(|e| {
+        // A 2xx body that does not match `T` is usually a Proton error
+        // object; report it as such rather than as a parse failure.
+        match ApiError::from_body(body) {
+            Some(api) if api.code != Some(ResponseCode::SUCCESS.0) => api.into(),
+            _ => anyhow::anyhow!(
+                "JSON parse error: {}. Body: {}",
+                e,
+                &body[..floor_char_boundary(body, 512)]
+            ),
+        }
+    })
+}
+
+/// Parses a body that may carry a Proton `Code`, failing with [`ApiError`]
+/// when `Code` is present and not 1000.
+pub(crate) fn parse_coded_json_body<T: serde::de::DeserializeOwned>(
+    body: &str,
+) -> anyhow::Result<T> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("Failed to decode response body: {}. Body: {}", e, body))?;
+    if let Some(code) = value.get("Code").and_then(|c| c.as_u64()) {
+        if code != u64::from(ResponseCode::SUCCESS.0) {
+            let error = ApiError::from_body(body)
+                .unwrap_or_else(|| ApiError::from_code(code as u32, "Unknown error"));
+            return Err(error.into());
+        }
+    }
+    serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("Failed to parse JSON: {}. Body: {}", e, body))
+}
+
+fn floor_char_boundary(text: &str, max: usize) -> usize {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -289,6 +360,85 @@ mod tests {
         let error = response.to_result().unwrap_err().to_string();
         assert!(error.contains("2500"));
         assert!(error.contains("Not found"));
+    }
+
+    #[test]
+    fn failed_api_response_is_a_typed_api_error() {
+        let response = ApiResponse {
+            code: ResponseCode(2501),
+            error_message: Some("Link does not exist".into()),
+        };
+        let error = response.to_result().unwrap_err();
+        let api = ApiError::find(&error).expect("typed error");
+        assert!(api.is_not_found());
+        assert_eq!(api.http_status, None);
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Payload {
+        #[serde(rename = "Value")]
+        value: u32,
+    }
+
+    #[test]
+    fn json_body_with_error_status_becomes_api_error() {
+        let error = parse_json_body::<Payload>(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            &reqwest::header::HeaderMap::new(),
+            r#"{"Code":200002,"Error":"Storage quota exceeded"}"#,
+        )
+        .unwrap_err();
+        let api = ApiError::find(&error).expect("typed error");
+        assert_eq!(api.http_status, Some(422));
+        assert!(api.is_quota_exceeded());
+        assert_eq!(
+            error.to_string(),
+            "API error 200002: Storage quota exceeded"
+        );
+    }
+
+    #[test]
+    fn json_body_with_success_status_but_error_code_becomes_api_error() {
+        let error = parse_json_body::<Payload>(
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            r#"{"Code":2500,"Error":"Already exists"}"#,
+        )
+        .unwrap_err();
+        assert!(ApiError::find(&error).unwrap().is_already_exists());
+    }
+
+    #[test]
+    fn json_body_with_success_status_parses_payload() {
+        let payload = parse_json_body::<Payload>(
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            r#"{"Code":1000,"Value":7}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.value, 7);
+    }
+
+    #[test]
+    fn malformed_success_body_stays_a_parse_error() {
+        let error = parse_json_body::<Payload>(
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            "not json",
+        )
+        .unwrap_err();
+        assert!(ApiError::find(&error).is_none());
+        assert!(error.to_string().starts_with("JSON parse error"));
+    }
+
+    #[test]
+    fn coded_body_rejects_non_success_codes() {
+        let error =
+            parse_coded_json_body::<serde_json::Value>(r#"{"Code":2011,"Error":"No access"}"#)
+                .unwrap_err();
+        assert!(ApiError::find(&error).unwrap().is_permission_denied());
+        let ok: serde_json::Value = parse_coded_json_body(r#"{"Code":1000,"X":1}"#).unwrap();
+        assert_eq!(ok["X"], 1);
     }
 
     #[test]

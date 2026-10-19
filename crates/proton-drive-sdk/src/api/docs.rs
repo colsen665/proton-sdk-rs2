@@ -1,4 +1,5 @@
 use crate::api::ApiResponse;
+use crate::error::ApiError;
 use crate::links::LinkId;
 use crate::volume::VolumeId;
 use async_trait::async_trait;
@@ -214,15 +215,11 @@ impl DefaultDocsApiClient {
     ) -> anyhow::Result<Vec<u8>> {
         let resp = builder.send().await?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let bytes = resp.bytes().await?;
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes);
-            if let Ok(api) = serde_json::from_str::<ApiResponse>(&body) {
-                if let Some(msg) = &api.error_message {
-                    return Err(anyhow::anyhow!("API error {}: {}", api.code.0, msg));
-                }
-            }
-            return Err(anyhow::anyhow!("HTTP {status}: {body}"));
+            return Err(ApiError::from_http(status, &headers, &body).into());
         }
         Ok(bytes.to_vec())
     }
@@ -231,14 +228,10 @@ impl DefaultDocsApiClient {
 
 async fn parse_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> anyhow::Result<T> {
     let status = resp.status();
+    let headers = resp.headers().clone();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        if let Ok(api) = serde_json::from_str::<ApiResponse>(&body) {
-            if let Some(msg) = &api.error_message {
-                return Err(anyhow::anyhow!("API error {}: {}", api.code.0, msg));
-            }
-        }
-        return Err(anyhow::anyhow!("HTTP {status}: {body}"));
+        return Err(ApiError::from_http(status, &headers, &body).into());
     }
     serde_json::from_str::<T>(&body).map_err(|e| {
         anyhow::anyhow!(
@@ -278,15 +271,11 @@ impl DocsApiClient for DefaultDocsApiClient {
         let builder = self.add_auth(self.client.get(url)).await?;
         let resp = builder.send().await?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let bytes = resp.bytes().await?;
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes);
-            if let Ok(api) = serde_json::from_str::<ApiResponse>(&body) {
-                if let Some(msg) = &api.error_message {
-                    return Err(anyhow::anyhow!("API error {}: {}", api.code.0, msg));
-                }
-            }
-            return Err(anyhow::anyhow!("HTTP {status}: {body}"));
+            return Err(ApiError::from_http(status, &headers, &body).into());
         }
         Ok(bytes.to_vec())
     }
@@ -308,17 +297,13 @@ impl DocsApiClient for DefaultDocsApiClient {
             .await?;
         let resp = builder.send().await?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            if let Ok(api) = serde_json::from_str::<ApiResponse>(&body) {
-                if api.is_success() {
-                    return Ok(());
-                }
-                if let Some(msg) = &api.error_message {
-                    return Err(anyhow::anyhow!("API error {}: {}", api.code.0, msg));
-                }
+            if serde_json::from_str::<ApiResponse>(&body).is_ok_and(|api| api.is_success()) {
+                return Ok(());
             }
-            return Err(anyhow::anyhow!("HTTP {status}: {body}"));
+            return Err(ApiError::from_http(status, &headers, &body).into());
         }
         Ok(())
     }
@@ -432,17 +417,13 @@ impl DocsApiClient for DefaultDocsApiClient {
             .await?;
         let resp = builder.send().await?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            if let Ok(api) = serde_json::from_str::<ApiResponse>(&body) {
-                if api.is_success() {
-                    return Ok(());
-                }
-                if let Some(msg) = &api.error_message {
-                    return Err(anyhow::anyhow!("API error {}: {}", api.code.0, msg));
-                }
+            if serde_json::from_str::<ApiResponse>(&body).is_ok_and(|api| api.is_success()) {
+                return Ok(());
             }
-            return Err(anyhow::anyhow!("HTTP {status}: {body}"));
+            return Err(ApiError::from_http(status, &headers, &body).into());
         }
         Ok(())
     }

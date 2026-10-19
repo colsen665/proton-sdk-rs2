@@ -193,6 +193,187 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
     value.parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// Failure reported by a Drive API endpoint.
+///
+/// The HTTP status and the Proton response code are kept typed so callers can
+/// classify a failure (not found, already exists, quota, retryable…) without
+/// parsing the message text. The `Display` output keeps the historical
+/// `"API error {code}: {message}"` / `"HTTP {status}: {body}"` wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ApiError {
+    /// HTTP status of the response, when the failure came from a non-2xx
+    /// response. `None` when the response was 2xx with an error `Code`.
+    pub http_status: Option<u16>,
+    /// Proton response code (`Code` in the JSON body), when present.
+    pub code: Option<u32>,
+    /// Proton error message (`Error` in the JSON body), or a body excerpt.
+    pub message: String,
+    /// Delay requested by a `Retry-After` header.
+    pub retry_after: Option<Duration>,
+    /// Endpoint-specific `Details` object of the error body, when present
+    /// (e.g. the conflicting link and revision of a draft conflict).
+    pub details: Option<serde_json::Value>,
+}
+
+impl ApiError {
+    pub const CODE_NOT_ENOUGH_PERMISSIONS: u32 = 2011;
+    pub const CODE_ALREADY_EXISTS: u32 = 2500;
+    pub const CODE_NOT_EXISTS: u32 = 2501;
+    pub const CODE_INSUFFICIENT_QUOTA: u32 = 200001;
+    pub const CODE_INSUFFICIENT_SPACE: u32 = 200002;
+    pub const CODE_MAX_FILE_SIZE_FOR_FREE_USER: u32 = 200003;
+    pub const CODE_INSUFFICIENT_VOLUME_QUOTA: u32 = 200100;
+    pub const CODE_INSUFFICIENT_DEVICE_QUOTA: u32 = 200101;
+    pub const CODE_TOO_MANY_CHILDREN: u32 = 200300;
+    pub const CODE_NESTING_TOO_DEEP: u32 = 200301;
+
+    /// Longest body excerpt kept in `message` when the body is not a Proton
+    /// error object.
+    const MAX_BODY_EXCERPT: usize = 512;
+
+    /// Error for a response that carried a non-success `Code` in its body.
+    pub fn from_code(code: u32, message: impl Into<String>) -> Self {
+        Self {
+            http_status: None,
+            code: Some(code),
+            message: message.into(),
+            retry_after: None,
+            details: None,
+        }
+    }
+
+    /// Error for a non-2xx response. Extracts `Code`/`Error`/`Details` when
+    /// the body is a Proton error object, otherwise keeps a body excerpt.
+    pub fn from_http(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        body: &str,
+    ) -> Self {
+        let mut error = Self::from_body(body).unwrap_or_else(|| Self {
+            http_status: None,
+            code: None,
+            message: Self::body_excerpt(body).to_owned(),
+            retry_after: None,
+            details: None,
+        });
+        error.http_status = Some(status.as_u16());
+        error.retry_after = parse_retry_after(headers);
+        error
+    }
+
+    /// Parses a Proton error object (`Code`, `Error`, optional `Details`).
+    /// Returns `None` when the body is not one.
+    pub fn from_body(body: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        let code = u32::try_from(value.get("Code")?.as_u64()?).ok()?;
+        let message = value
+            .get("Error")
+            .and_then(|message| message.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| Self::body_excerpt(body).to_owned());
+        let details = value.get("Details").filter(|d| !d.is_null()).cloned();
+        Some(Self {
+            details,
+            ..Self::from_code(code, message)
+        })
+    }
+
+    /// Deserializes [`ApiError::details`] into an endpoint-specific type.
+    pub fn details_as<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        serde_json::from_value(self.details.clone()?).ok()
+    }
+
+    /// Finds an `ApiError` anywhere in an error's context chain.
+    pub fn find(error: &anyhow::Error) -> Option<&ApiError> {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ApiError>())
+    }
+
+    fn body_excerpt(body: &str) -> &str {
+        let mut end = body.len().min(Self::MAX_BODY_EXCERPT);
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        &body[..end]
+    }
+
+    fn has_code(&self, codes: &[u32]) -> bool {
+        self.code.is_some_and(|code| codes.contains(&code))
+    }
+
+    fn has_status(&self, statuses: &[u16]) -> bool {
+        self.http_status
+            .is_some_and(|status| statuses.contains(&status))
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.has_code(&[Self::CODE_NOT_EXISTS]) || self.has_status(&[404])
+    }
+
+    pub fn is_already_exists(&self) -> bool {
+        self.has_code(&[Self::CODE_ALREADY_EXISTS])
+    }
+
+    pub fn is_permission_denied(&self) -> bool {
+        self.has_code(&[Self::CODE_NOT_ENOUGH_PERMISSIONS]) || self.has_status(&[403])
+    }
+
+    pub fn is_unauthorized(&self) -> bool {
+        self.has_status(&[401])
+    }
+
+    pub fn is_quota_exceeded(&self) -> bool {
+        self.has_code(&[
+            Self::CODE_INSUFFICIENT_QUOTA,
+            Self::CODE_INSUFFICIENT_SPACE,
+            Self::CODE_INSUFFICIENT_VOLUME_QUOTA,
+            Self::CODE_INSUFFICIENT_DEVICE_QUOTA,
+        ])
+    }
+
+    pub fn is_file_too_large(&self) -> bool {
+        self.has_code(&[Self::CODE_MAX_FILE_SIZE_FOR_FREE_USER])
+    }
+
+    pub fn is_too_many_children(&self) -> bool {
+        self.has_code(&[Self::CODE_TOO_MANY_CHILDREN])
+    }
+
+    pub fn is_nesting_too_deep(&self) -> bool {
+        self.has_code(&[Self::CODE_NESTING_TOO_DEEP])
+    }
+
+    pub fn is_rate_limited(&self) -> bool {
+        self.has_status(&[429])
+    }
+
+    /// Returns whether repeating the same request may succeed: request
+    /// timeouts, rate limiting and server-side failures.
+    pub fn is_retryable(&self) -> bool {
+        self.http_status
+            .is_some_and(|status| matches!(status, 408 | 425 | 429) || status >= 500)
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.code, self.http_status) {
+            (Some(code), _) => write!(f, "API error {}: {}", code, self.message),
+            (None, Some(status)) => {
+                let status = reqwest::StatusCode::from_u16(status)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| status.to_string());
+                write!(f, "HTTP {}: {}", status, self.message)
+            }
+            (None, None) => write!(f, "API error: {}", self.message),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 /// C# RetryPolicy: `2^(attempt-2)` seconds plus up to 250ms jitter.
 pub fn retry_backoff_delay(attempt: u32) -> Duration {
     let exp = 2u64.saturating_pow(attempt.saturating_sub(1).min(6));
@@ -358,6 +539,99 @@ mod tests {
         assert!(is_not_application_error_name("OfflineError"));
         assert!(is_not_application_error_name("TimeoutError"));
         assert!(!is_not_application_error_name("Error"));
+    }
+
+    #[test]
+    fn api_error_from_http_extracts_proton_code_and_message() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        let error = ApiError::from_http(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            &headers,
+            r#"{"Code":2500,"Error":"A file or folder with that name already exists"}"#,
+        );
+        assert_eq!(error.http_status, Some(422));
+        assert_eq!(error.code, Some(2500));
+        assert!(error.is_already_exists());
+        assert_eq!(error.retry_after, Some(Duration::from_secs(7)));
+        assert_eq!(
+            error.to_string(),
+            "API error 2500: A file or folder with that name already exists"
+        );
+    }
+
+    #[test]
+    fn api_error_keeps_the_details_object() {
+        #[derive(serde::Deserialize)]
+        struct Conflict {
+            #[serde(rename = "ConflictLinkID")]
+            link_id: String,
+        }
+        let error = ApiError::from_http(
+            reqwest::StatusCode::CONFLICT,
+            &reqwest::header::HeaderMap::new(),
+            r#"{"Code":2500,"Error":"Conflict","Details":{"ConflictLinkID":"link-1"}}"#,
+        );
+        assert_eq!(error.http_status, Some(409));
+        let conflict: Conflict = error.details_as().expect("details");
+        assert_eq!(conflict.link_id, "link-1");
+        assert!(
+            ApiError::from_body(r#"{"Code":2500,"Error":"x","Details":null}"#)
+                .unwrap()
+                .details
+                .is_none()
+        );
+        assert!(ApiError::from_body("not json").is_none());
+    }
+
+    #[test]
+    fn api_error_from_http_keeps_a_bounded_excerpt_of_non_json_bodies() {
+        let body = "é".repeat(600);
+        let error = ApiError::from_http(
+            reqwest::StatusCode::BAD_GATEWAY,
+            &reqwest::header::HeaderMap::new(),
+            &body,
+        );
+        assert_eq!(error.code, None);
+        assert!(error.message.len() <= 512);
+        assert!(error.is_retryable());
+        assert!(error.to_string().starts_with("HTTP 502 Bad Gateway: "));
+    }
+
+    #[test]
+    fn api_error_classifies_proton_codes_and_statuses() {
+        assert!(ApiError::from_code(2501, "gone").is_not_found());
+        assert!(ApiError::from_code(2011, "no").is_permission_denied());
+        for code in [200001, 200002, 200100, 200101] {
+            assert!(ApiError::from_code(code, "full").is_quota_exceeded());
+        }
+        assert!(ApiError::from_code(200003, "big").is_file_too_large());
+        assert!(ApiError::from_code(200300, "many").is_too_many_children());
+        assert!(ApiError::from_code(200301, "deep").is_nesting_too_deep());
+
+        let status = |code: u16| ApiError {
+            http_status: Some(code),
+            code: None,
+            message: String::new(),
+            retry_after: None,
+            details: None,
+        };
+        assert!(status(404).is_not_found());
+        assert!(status(401).is_unauthorized());
+        assert!(status(429).is_rate_limited());
+        assert!(status(429).is_retryable());
+        assert!(status(503).is_retryable());
+        assert!(!status(400).is_retryable());
+        assert!(!ApiError::from_code(2500, "exists").is_retryable());
+    }
+
+    #[test]
+    fn api_error_is_found_through_context_layers() {
+        let error = anyhow::Error::new(ApiError::from_code(2501, "gone"))
+            .context("Failed to get node")
+            .context("Failed to list folder");
+        assert_eq!(ApiError::find(&error).and_then(|e| e.code), Some(2501));
+        assert!(ApiError::find(&anyhow::anyhow!("plain")).is_none());
     }
 
     #[test]

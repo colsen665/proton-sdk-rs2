@@ -707,18 +707,17 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         let url = self.base_url.join("photos/volumes")?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<VolumeCreationResponse>()
-            .await?)
+        Ok(
+            crate::api::parse_json_response::<VolumeCreationResponse>(builder.send().await?)
+                .await?,
+        )
     }
 
     async fn get_root_share(&self) -> anyhow::Result<ShareResponseV2> {
         let url = self.base_url.join("v2/shares/photos")?;
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<ShareResponseV2>().await?)
+        Ok(crate::api::parse_json_response::<ShareResponseV2>(builder.send().await?).await?)
     }
 
     async fn get_timeline_photos(
@@ -737,11 +736,10 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
 
-        Ok(builder
-            .send()
-            .await?
-            .json::<TimelinePhotoListResponse>()
-            .await?)
+        Ok(
+            crate::api::parse_json_response::<TimelinePhotoListResponse>(builder.send().await?)
+                .await?,
+        )
     }
 
     async fn check_duplicates(
@@ -757,11 +755,10 @@ impl PhotosApiClient for DefaultPhotosApiClient {
             .post(url)
             .json(&CheckDuplicatesRequest { name_hashes });
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<CheckDuplicatesResponse>()
-            .await?)
+        Ok(
+            crate::api::parse_json_response::<CheckDuplicatesResponse>(builder.send().await?)
+                .await?,
+        )
     }
 
     async fn get_albums(
@@ -779,7 +776,7 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         };
         let url = self.base_url.join(&path)?;
         let builder = self.add_auth_headers(self.client.get(url)).await?;
-        Ok(builder.send().await?.json::<AlbumsListResponse>().await?)
+        Ok(crate::api::parse_json_response::<AlbumsListResponse>(builder.send().await?).await?)
     }
 
     async fn get_album_children(
@@ -803,11 +800,7 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         };
         let url = self.base_url.join(&path)?;
         let builder = self.add_auth_headers(self.client.get(url)).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<AlbumChildrenResponse>()
-            .await?)
+        Ok(crate::api::parse_json_response::<AlbumChildrenResponse>(builder.send().await?).await?)
     }
 
     async fn create_album(
@@ -821,11 +814,7 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         let builder = self
             .add_auth_headers(self.client.post(url).json(&request))
             .await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<AlbumCreationResponse>()
-            .await?)
+        Ok(crate::api::parse_json_response::<AlbumCreationResponse>(builder.send().await?).await?)
     }
 
     async fn update_album(
@@ -877,11 +866,10 @@ impl PhotosApiClient for DefaultPhotosApiClient {
         let builder = self
             .add_auth_headers(self.client.post(url).json(&request))
             .await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<AddPhotosToAlbumResponse>()
-            .await?)
+        Ok(
+            crate::api::parse_json_response::<AddPhotosToAlbumResponse>(builder.send().await?)
+                .await?,
+        )
     }
 
     async fn remove_photos_from_album(
@@ -1075,7 +1063,7 @@ impl LinksApiClient for PhotosLinksApiClient {
             .post(url)
             .json(&LinkDetailsRequest::new(link_ids));
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<LinkDetailsResponse>().await?)
+        Ok(crate::api::parse_json_response::<LinkDetailsResponse>(builder.send().await?).await?)
     }
 
     /// Delegated to drive implementation.

@@ -229,19 +229,7 @@ impl DefaultSharesApiClient {
         let builder = self.add_auth_headers(builder).await?;
         let response = builder.send().await?;
         let text = response.text().await?;
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("Failed to decode JSON: {}. Body: {}", e, text))?;
-        if let Some(code) = value.get("Code").and_then(|c| c.as_u64()) {
-            if code != 1000 {
-                let error = value
-                    .get("Error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("Unknown error");
-                anyhow::bail!("API error: code {}, message: {}", code, error);
-            }
-        }
-        serde_json::from_value(value)
-            .map_err(|e| anyhow::anyhow!("Failed to parse JSON: {}. Body: {}", e, text))
+        super::parse_coded_json_body(&text)
     }
 
     async fn send_ok(&self, builder: reqwest_middleware::RequestBuilder) -> anyhow::Result<()> {
@@ -268,28 +256,7 @@ impl SharesApiClient for DefaultSharesApiClient {
         let text = response.text().await?;
         tracing::debug!(body = %text, "get_my_files_share raw response");
 
-        let res: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            anyhow::anyhow!("Failed to decode response body: {}. Body: {}", e, text)
-        })?;
-
-        if let Some(code) = res.get("Code").and_then(|c| c.as_u64()) {
-            if code != 1000 {
-                let error = res
-                    .get("Error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("Unknown error");
-                anyhow::bail!("API error: code {}, message: {}", code, error);
-            }
-        }
-
-        let share_response: ShareResponseV2 = serde_json::from_value(res).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse my-files share response: {}. Body: {}",
-                e,
-                text
-            )
-        })?;
-        Ok(share_response)
+        super::parse_coded_json_body::<ShareResponseV2>(&text)
     }
 
     async fn get_share(&self, id: ShareId) -> anyhow::Result<ShareResponse> {

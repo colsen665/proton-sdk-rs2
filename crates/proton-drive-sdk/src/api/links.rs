@@ -175,7 +175,7 @@ impl LinksApiClient for DefaultLinksApiClient {
         ))?;
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<ContextShareResponse>().await?)
+        Ok(crate::api::parse_json_response::<ContextShareResponse>(builder.send().await?).await?)
     }
 
     async fn move_link(
@@ -240,7 +240,7 @@ impl LinksApiClient for DefaultLinksApiClient {
         ))?;
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<ApiResponse>().await?)
+        Ok(crate::api::parse_json_response::<ApiResponse>(builder.send().await?).await?)
     }
 
     async fn delete_multiple(
@@ -256,11 +256,12 @@ impl LinksApiClient for DefaultLinksApiClient {
             .post(url)
             .json(&MultipleLinksNullaryRequest { link_ids });
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<AggregateApiResponse<LinkIdResponsePair>>()
-            .await?)
+        Ok(
+            crate::api::parse_json_response::<AggregateApiResponse<LinkIdResponsePair>>(
+                builder.send().await?,
+            )
+            .await?,
+        )
     }
 
     async fn get_available_names(
@@ -276,11 +277,10 @@ impl LinksApiClient for DefaultLinksApiClient {
         ))?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<NodeNameAvailabilityResponse>()
-            .await?)
+        Ok(
+            crate::api::parse_json_response::<NodeNameAvailabilityResponse>(builder.send().await?)
+                .await?,
+        )
     }
 
     async fn copy_link(
