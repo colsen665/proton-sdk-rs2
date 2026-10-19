@@ -1003,6 +1003,7 @@ mod tests {
                 name: name.into(),
                 ..Default::default()
             },
+            claimed_modification_time: None,
         })
     }
 
