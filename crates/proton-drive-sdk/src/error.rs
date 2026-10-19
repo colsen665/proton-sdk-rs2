@@ -286,9 +286,15 @@ impl ApiError {
 
     /// Finds an `ApiError` anywhere in an error's context chain.
     pub fn find(error: &anyhow::Error) -> Option<&ApiError> {
-        error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<ApiError>())
+        error.chain().find_map(|cause| {
+            cause.downcast_ref::<ApiError>().or_else(|| {
+                // Errors raised by middleware are wrapped transparently.
+                match cause.downcast_ref::<reqwest_middleware::Error>() {
+                    Some(reqwest_middleware::Error::Middleware(inner)) => Self::find(inner),
+                    _ => None,
+                }
+            })
+        })
     }
 
     fn body_excerpt(body: &str) -> &str {

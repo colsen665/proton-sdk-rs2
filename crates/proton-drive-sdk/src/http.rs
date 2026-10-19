@@ -1,3 +1,5 @@
+pub mod retry;
+
 use reqwest_middleware::ClientWithMiddleware;
 
 pub struct PublicLinkSessionMiddleware {
