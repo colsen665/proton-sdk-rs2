@@ -1173,6 +1173,13 @@ impl DtoToMetadataConverter {
                     &decryption.hash_key,
                     &decryption.link.node_key,
                 ) {
+                    let claimed_modification_time =
+                        crate::node::folder::decrypt_folder_modification_time(
+                            folder_dto.extended_attributes.as_ref(),
+                            node_key,
+                            &decryption.link.node_authorship_claim,
+                            &uid,
+                        );
                     let node_base = NodeBase {
                         uid: uid.clone(),
                         parent_uid,
@@ -1225,7 +1232,13 @@ impl DtoToMetadataConverter {
                     };
 
                     Ok(PotentialObject::Node(NodeMetadata {
-                        inner: NodeAndSecrets::Folder(FolderNode { base: node_base }, secrets),
+                        inner: NodeAndSecrets::Folder(
+                            FolderNode {
+                                base: node_base,
+                                claimed_modification_time,
+                            },
+                            secrets,
+                        ),
                         membership_share_id: link_details
                             .sharing
                             .as_ref()

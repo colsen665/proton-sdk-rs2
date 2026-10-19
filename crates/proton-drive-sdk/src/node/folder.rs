@@ -4,9 +4,9 @@ use crate::node::{
     DegradedNode, DtoToMetadataConverter, Node, NodeBase, NodeMetadataResult, NodeSecrets, NodeUid,
     OwnedBy,
 };
-use crate::pgp::PgpPrivateKey;
+use crate::pgp::{PgpArmoredMessage, PgpPrivateKey};
 use crate::utils::PotentialObject;
-use chrono::Utc;
+use chrono::{DateTime, SubsecRound, Utc};
 use std::sync::Arc;
 
 pub struct FolderOperations;
@@ -32,7 +32,7 @@ impl FolderOperations {
         client: &ProtonDriveClient,
         parent_uid: NodeUid,
         name: String,
-        _last_modification_time: Option<std::time::SystemTime>,
+        last_modification_time: Option<std::time::SystemTime>,
     ) -> anyhow::Result<FolderNode> {
         let membership_address = client
             .account()
@@ -86,6 +86,16 @@ impl FolderOperations {
             &PgpPrivateKey(membership_address.clone()),
         )?;
 
+        // Folder XAttr carries millisecond precision; keep the returned node consistent
+        // with what a later read decodes.
+        let claimed_modification_time =
+            last_modification_time.map(|t| DateTime::<Utc>::from(t).trunc_subsecs(3));
+        let encrypted_extended_attributes = encrypt_folder_extended_attributes(
+            claimed_modification_time,
+            &folder_secrets.base.key,
+            &PgpPrivateKey(membership_address.clone()),
+        )?;
+
         let request = crate::api::folder::FolderCreationRequest {
             base: crate::api::node::NodeCreationRequest {
                 name: encrypted_name,
@@ -103,7 +113,7 @@ impl FolderOperations {
                 .await?
                 .email_address
                 .clone(),
-            extended_attributes: None,
+            extended_attributes: encrypted_extended_attributes,
         };
 
         let response = client
@@ -139,6 +149,7 @@ impl FolderOperations {
                 membership: None,
                 ..NodeBase::default()
             },
+            claimed_modification_time,
         };
 
         // Cache the newly created folder secrets
@@ -290,6 +301,78 @@ pub struct FolderSizeInfo {
 pub struct FolderNode {
     #[serde(flatten)]
     pub base: crate::node::NodeBase,
+    /// Last-modification time claimed in the folder's extended attributes (XAttr);
+    /// `None` if the folder has no XAttr, it is unreadable, or it carries no time.
+    #[serde(default)]
+    pub claimed_modification_time: Option<DateTime<Utc>>,
+}
+
+/// Builds the folder XAttr JSON (`{"Common":{"ModificationTime":"<ISO 8601>"}}`), encrypts
+/// it to the folder key and signs it with `signing_key`, as the official SDKs do on folder
+/// creation. Returns `None` without a modification time, like the JS SDK.
+pub(crate) fn encrypt_folder_extended_attributes(
+    modification_time: Option<DateTime<Utc>>,
+    folder_key: &PgpPrivateKey,
+    signing_key: &PgpPrivateKey,
+) -> anyhow::Result<Option<PgpArmoredMessage>> {
+    use proton_rpgp::AsPublicKeyRef;
+
+    let Some(modification_time) = modification_time else {
+        return Ok(None);
+    };
+    let xattr = crate::api::attr::ExtendedAttributes {
+        common: Some(crate::api::attr::CommonExtendedAttributes {
+            size: None,
+            modification_time: Some(modification_time),
+            block_sizes: None,
+            digests: None,
+        }),
+        media: None,
+        additional_metadata: Default::default(),
+    };
+    let json = serde_json::to_vec(&xattr)?;
+    let result = proton_rpgp::Encryptor::default()
+        .with_encryption_key(folder_key.0.as_public_key())
+        .with_signing_key(&signing_key.0)
+        .encrypt(&json)?;
+    Ok(Some(PgpArmoredMessage(String::from_utf8(result.armor()?)?)))
+}
+
+/// Decrypts a folder XAttr with the folder key, verifies its signature against the node
+/// authorship claim, and returns `Common.ModificationTime`. Returns `None` when the XAttr
+/// is absent; logs a warning and returns `None` when it cannot be decrypted or parsed.
+/// A failed signature check is logged and the claimed time is still returned.
+pub(crate) fn decrypt_folder_modification_time(
+    message: Option<&PgpArmoredMessage>,
+    folder_key: &PgpPrivateKey,
+    authorship_claim: &crate::node::authorship::AuthorshipClaim,
+    folder_uid: &NodeUid,
+) -> Option<DateTime<Utc>> {
+    let message = message?;
+    let parsed = NodeCrypto::decrypt_message(message, None, [folder_key], authorship_claim)
+        .map_err(|e| anyhow::anyhow!("failed to decrypt folder extended attributes: {e}"))
+        .and_then(|(bytes, _, verification_failure)| {
+            if verification_failure.is_some() {
+                tracing::warn!(
+                    folder = %folder_uid,
+                    author = ?authorship_claim.author.email_address,
+                    "folder extended attributes signature verification failed"
+                );
+            }
+            serde_json::from_slice::<crate::api::attr::ExtendedAttributes>(&bytes)
+                .map_err(|e| anyhow::anyhow!("failed to parse folder extended attributes: {e}"))
+        });
+    match parsed {
+        Ok(xattr) => xattr.common.and_then(|c| c.modification_time),
+        Err(error) => {
+            tracing::warn!(
+                folder = %folder_uid,
+                error = %error,
+                "ignoring unreadable folder extended attributes"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -323,4 +406,169 @@ pub struct DegradedFolderMetadata {
 pub struct DegradedFolderSecrets {
     pub base: crate::node::secrets::DegradedNodeSecrets,
     pub hash_key: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::CryptoGenerator;
+    use crate::node::authorship::AuthorshipClaim;
+    use chrono::TimeZone;
+    use proton_rpgp::AsPublicKeyRef;
+
+    fn claim_for(signer: &PgpPrivateKey) -> AuthorshipClaim {
+        AuthorshipClaim {
+            keys: vec![signer.0.as_public_key().clone()],
+            author: crate::author::Author {
+                email_address: Some("member@example.test".into()),
+            },
+            key_retrieval_error_message: None,
+        }
+    }
+
+    #[test]
+    fn folder_xattr_round_trips_modification_time() {
+        let folder_key = CryptoGenerator::generate_private_key().unwrap();
+        let address_key = CryptoGenerator::generate_private_key().unwrap();
+        let mtime = Utc.timestamp_millis_opt(1_234_567_890_123).unwrap();
+
+        let message = encrypt_folder_extended_attributes(Some(mtime), &folder_key, &address_key)
+            .unwrap()
+            .unwrap();
+
+        // Same JSON shape as the JS and C# SDKs write on folder creation.
+        let (bytes, _, verification_failure) =
+            NodeCrypto::decrypt_message(&message, None, [&folder_key], &claim_for(&address_key))
+                .unwrap();
+        assert!(verification_failure.is_none());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({"Common": {"ModificationTime": "2009-02-13T23:31:30.123Z"}})
+        );
+
+        let decoded = decrypt_folder_modification_time(
+            Some(&message),
+            &folder_key,
+            &claim_for(&address_key),
+            &NodeUid::from_parts("volume", "folder"),
+        );
+        assert_eq!(decoded, Some(mtime));
+    }
+
+    /// Builds folder link details the way `FolderOperations::create` encrypts them.
+    fn folder_link_details(
+        parent_key: &PgpPrivateKey,
+        signing_key: &PgpPrivateKey,
+        modification_time: Option<DateTime<Utc>>,
+    ) -> crate::api::links::LinkDetailsDto {
+        let folder_key = CryptoGenerator::generate_private_key().unwrap();
+        let passphrase = CryptoGenerator::generate_passphrase();
+        let locked_key = folder_key
+            .to_armored_private_key(Some(passphrase.as_bytes()))
+            .unwrap();
+        let (encrypted_passphrase, passphrase_signature, _) =
+            NodeCrypto::encrypt_and_sign_passphrase(passphrase.as_bytes(), parent_key, signing_key)
+                .unwrap();
+        let parent_hash_key = CryptoGenerator::generate_folder_hash_key();
+        let (name, name_hash, _) =
+            NodeCrypto::encrypt_and_sign_name("Photos", &parent_hash_key, parent_key, signing_key)
+                .unwrap();
+        let hash_key = NodeCrypto::encrypt_folder_hash_key(
+            &folder_key,
+            &CryptoGenerator::generate_folder_hash_key(),
+            signing_key,
+        )
+        .unwrap();
+        let xattr = encrypt_folder_extended_attributes(modification_time, &folder_key, signing_key)
+            .unwrap();
+        serde_json::from_value(serde_json::json!({
+            "Link": {
+                "LinkID": "folder", "ParentLinkID": "parent", "Type": 1, "State": 1,
+                "CreateTime": 1_600_000_000, "ModifyTime": 1_600_000_000,
+                "Name": name.0, "NameHash": hex::encode(name_hash),
+                "NodeKey": locked_key.0, "NodePassphrase": encrypted_passphrase.0,
+                "NodePassphraseSignature": passphrase_signature.unwrap().0,
+                "SignatureEmail": "member@example.test",
+                "NameSignatureEmail": "member@example.test"
+            },
+            "Folder": {
+                "NodeHashKey": hash_key.0,
+                "XAttr": xattr.map(|m| m.0),
+            }
+        }))
+        .unwrap()
+    }
+
+    async fn convert_folder(
+        details: crate::api::links::LinkDetailsDto,
+        parent_key: &PgpPrivateKey,
+    ) -> FolderNode {
+        let (client, _) = crate::test_support::client().await;
+        let metadata = DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+            &client,
+            crate::volume::VolumeId::new("volume".into()),
+            details,
+            Some(parent_key),
+        )
+        .await
+        .unwrap();
+        match metadata {
+            PotentialObject::Node(m) => match m.node() {
+                Node::Folder(folder) => folder,
+                other => panic!("expected folder, got {other:?}"),
+            },
+            PotentialObject::Degraded(_) => panic!("folder conversion degraded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_conversion_exposes_folder_modification_time() {
+        let parent_key = CryptoGenerator::generate_private_key().unwrap();
+        let address_key = CryptoGenerator::generate_private_key().unwrap();
+        let mtime = Utc.timestamp_millis_opt(1_650_000_000_250).unwrap();
+
+        let details = folder_link_details(&parent_key, &address_key, Some(mtime));
+        let folder = convert_folder(details, &parent_key).await;
+        assert_eq!(folder.base.name, "Photos");
+        assert_eq!(folder.claimed_modification_time, Some(mtime));
+
+        let details = folder_link_details(&parent_key, &address_key, None);
+        let folder = convert_folder(details, &parent_key).await;
+        assert_eq!(folder.claimed_modification_time, None);
+    }
+
+    #[test]
+    fn folder_without_modification_time_has_no_xattr() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        assert!(
+            encrypt_folder_extended_attributes(None, &key, &key)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn absent_or_unreadable_folder_xattr_gives_none() {
+        let folder_key = CryptoGenerator::generate_private_key().unwrap();
+        let other_key = CryptoGenerator::generate_private_key().unwrap();
+        let uid = NodeUid::from_parts("volume", "folder");
+        let claim = claim_for(&folder_key);
+        assert_eq!(
+            decrypt_folder_modification_time(None, &folder_key, &claim, &uid),
+            None
+        );
+        let wrong_key = encrypt_folder_extended_attributes(
+            Some(Utc.timestamp_opt(1_600_000_000, 0).unwrap()),
+            &other_key,
+            &other_key,
+        )
+        .unwrap()
+        .unwrap();
+        for message in [wrong_key, PgpArmoredMessage("invalid".into())] {
+            assert_eq!(
+                decrypt_folder_modification_time(Some(&message), &folder_key, &claim, &uid),
+                None
+            );
+        }
+    }
 }
