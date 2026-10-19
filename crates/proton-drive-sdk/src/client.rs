@@ -1003,6 +1003,18 @@ impl ProtonDriveClient {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Moves a single node to `new_parent_folder_uid` and, when `new_name` is given, renames it
+    /// in the same request (like `rename(2)` across directories).
+    /// With `new_name` set to `None` this is the single-node form of [`Self::move_nodes`].
+    pub async fn move_node(
+        &self,
+        uid: NodeUid,
+        new_parent_folder_uid: NodeUid,
+        new_name: Option<String>,
+    ) -> anyhow::Result<()> {
+        NodeOperations::move_single(self, uid, new_parent_folder_uid, new_name).await
+    }
+
     /// Moves nodes concurrently and yields each independent result as soon as it completes.
     pub fn move_nodes_stream(
         &self,
@@ -1461,6 +1473,20 @@ mod transfer_concurrency_tests {
 #[cfg(test)]
 mod move_result_tests {
     use super::*;
+
+    #[test]
+    fn move_node_takes_an_optional_new_name() {
+        fn move_and_rename(
+            client: &ProtonDriveClient,
+        ) -> impl std::future::Future<Output = anyhow::Result<()>> + '_ {
+            client.move_node(
+                NodeUid::from_parts("volume", "node"),
+                NodeUid::from_parts("volume", "target"),
+                Some("renamed.txt".into()),
+            )
+        }
+        let _ = move_and_rename;
+    }
 
     #[test]
     fn aggregate_move_keeps_the_first_failure_without_rejecting_successes() {

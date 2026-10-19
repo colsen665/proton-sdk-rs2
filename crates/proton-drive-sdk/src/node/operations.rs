@@ -13,6 +13,25 @@ use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Returns the name a node has after a move: `new_name` when given, else its current name.
+fn moved_node_name(node: &Node, new_name: Option<&str>) -> String {
+    match new_name {
+        Some(name) => name.to_string(),
+        None => match node {
+            Node::Folder(f) | Node::Album(f) => f.base.name.clone(),
+            Node::File(f) | Node::Photo(f) => f.base.base.name.clone(),
+        },
+    }
+}
+
+/// Applies a completed move, with an optional rename, to the node stored in the entity cache.
+fn apply_move_to_node(node: &mut Node, new_parent_uid: NodeUid, new_name: Option<String>) {
+    node.set_parent_uid(Some(new_parent_uid));
+    if let Some(name) = new_name {
+        node.set_name(name);
+    }
+}
+
 pub struct NodeOperations;
 
 impl NodeOperations {
@@ -379,11 +398,7 @@ impl NodeOperations {
             crate::node::NodeAndSecrets::Folder(_, s) => s.base,
         };
 
-        let name_to_use = new_name.as_ref().cloned().unwrap_or_else(|| match &node {
-            Node::Folder(f) => f.base.name.clone(),
-            Node::File(f) | Node::Photo(f) => f.base.base.name.clone(),
-            Node::Album(f) => f.base.name.clone(),
-        });
+        let name_to_use = moved_node_name(&node, new_name.as_deref());
 
         log::debug!(
             "Moving node: name={}, original_hash={}",
@@ -446,11 +461,7 @@ impl NodeOperations {
 
         // Update cache
         let (mut node, _, membership_share_id, _) = metadata_result.clone().result()?.deconstruct();
-
-        node.set_parent_uid(Some(new_parent_uid));
-        if let Some(name) = new_name {
-            node.set_name(name);
-        }
+        apply_move_to_node(&mut node, new_parent_uid, new_name);
 
         client
             .cache()
@@ -975,5 +986,66 @@ impl NodeOperations {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_move_to_node, moved_node_name};
+    use crate::node::folder::FolderNode;
+    use crate::node::{Node, NodeBase, NodeUid};
+
+    fn folder(name: &str, parent: &str) -> Node {
+        Node::Folder(FolderNode {
+            base: NodeBase {
+                uid: NodeUid::from_parts("volume", "node"),
+                parent_uid: Some(NodeUid::from_parts("volume", parent)),
+                name: name.into(),
+                ..Default::default()
+            },
+        })
+    }
+
+    fn name_and_parent(node: &Node) -> (String, Option<NodeUid>) {
+        match node {
+            Node::Folder(f) | Node::Album(f) => (f.base.name.clone(), f.base.parent_uid.clone()),
+            Node::File(f) | Node::Photo(f) => {
+                (f.base.base.name.clone(), f.base.base.parent_uid.clone())
+            }
+        }
+    }
+
+    #[test]
+    fn move_encrypts_the_new_name_when_one_is_given() {
+        let node = folder("old.txt", "source");
+        assert_eq!(moved_node_name(&node, Some("new.txt")), "new.txt");
+        assert_eq!(moved_node_name(&node, None), "old.txt");
+    }
+
+    #[test]
+    fn moved_node_in_cache_gets_the_new_parent_and_name() {
+        let mut renamed = folder("old.txt", "source");
+        apply_move_to_node(
+            &mut renamed,
+            NodeUid::from_parts("volume", "target"),
+            Some("new.txt".into()),
+        );
+        assert_eq!(
+            name_and_parent(&renamed),
+            (
+                "new.txt".into(),
+                Some(NodeUid::from_parts("volume", "target"))
+            )
+        );
+
+        let mut moved = folder("old.txt", "source");
+        apply_move_to_node(&mut moved, NodeUid::from_parts("volume", "target"), None);
+        assert_eq!(
+            name_and_parent(&moved),
+            (
+                "old.txt".into(),
+                Some(NodeUid::from_parts("volume", "target"))
+            )
+        );
     }
 }
