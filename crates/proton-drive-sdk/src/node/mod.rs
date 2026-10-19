@@ -1365,61 +1365,13 @@ impl DtoToMetadataConverter {
                                     base: node_base,
                                     media_type: file_dto.media_type.clone(),
                                 },
-                                active_revision: crate::node::revision::Revision {
-                                    uid: crate::node::revision::RevisionUid {
-                                        node_uid: uid.clone(),
-                                        revision_id: file_dto
-                                            .active_revision
-                                            .as_ref()
-                                            .map(|r| r.id.clone())
-                                            .unwrap_or_default(),
-                                    },
-                                    creation_time: file_dto
-                                        .active_revision
-                                        .as_ref()
-                                        .map(|r| r.creation_time)
-                                        .unwrap_or_else(|| Utc::now()),
-                                    size_on_cloud_storage: file_dto
-                                        .active_revision
-                                        .as_ref()
-                                        .map(|r| r.storage_quota_consumption)
-                                        .unwrap_or(0),
-                                    claimed_size: Some(
-                                        file_dto
-                                            .active_revision
-                                            .as_ref()
-                                            .map(|r| r.storage_quota_consumption)
-                                            .unwrap_or(0),
+                                active_revision:
+                                    crate::node::revision::Revision::from_active_revision_dto(
+                                        &uid,
+                                        file_dto.active_revision.as_ref(),
+                                        &node_key,
+                                        &decryption.content_authorship_claim,
                                     ),
-                                    claimed_digests: crate::node::file::FileContentDigests {
-                                        sha1: None,
-                                    },
-                                    claimed_modification_time: Some(
-                                        file_dto
-                                            .active_revision
-                                            .as_ref()
-                                            .map(|r| r.creation_time)
-                                            .unwrap_or_else(|| Utc::now()),
-                                    ),
-                                    thumbnails: file_dto
-                                        .active_revision
-                                        .as_ref()
-                                        .map(|r| {
-                                            #[allow(deprecated)]
-                                            r.thumbnails
-                                                .iter()
-                                                .map(|t| crate::protobuf::ThumbnailHeader {
-                                                    id: t.id.clone(),
-                                                    r#type: t.r#type as i32,
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default(),
-                                    additional_claimed_metadata: None,
-                                    content_author: Some(
-                                        decryption.content_authorship_claim.to_potential_author(),
-                                    ),
-                                },
                                 total_size_on_cloud_storage: file_dto.total_size_on_storage,
                             },
                             secrets,
