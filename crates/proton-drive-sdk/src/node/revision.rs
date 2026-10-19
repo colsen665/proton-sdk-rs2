@@ -79,6 +79,10 @@ pub struct Revision {
     pub additional_claimed_metadata: Option<Vec<AdditionalMetadataProperty>>,
     /// Authorship claim for the content signature.
     pub content_author: Option<PotentialObject<Author, SignatureVerificationError>>,
+    /// Plaintext block sizes declared by the uploader, in block order; `None` if the
+    /// extended attributes are absent, unreadable, or do not list them.
+    #[serde(default)]
+    pub claimed_block_sizes: Option<Vec<i32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
@@ -166,6 +170,162 @@ impl TryFrom<String> for RevisionUid {
     type Error = String;
     fn try_from(s: String) -> Result<Self, Self::Error> {
         RevisionUid::parse(&s)
+    }
+}
+
+/// Values the uploader claimed in a revision's encrypted extended attributes (XAttr).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClaimedRevisionAttributes {
+    pub size: Option<i64>,
+    pub modification_time: Option<DateTime<Utc>>,
+    pub sha1: Option<Vec<u8>>,
+    pub block_sizes: Option<Vec<i32>>,
+    pub additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+}
+
+impl ClaimedRevisionAttributes {
+    /// Maps parsed extended attributes to claimed revision values. Top-level keys other
+    /// than `Common` and `Media` (the flattened `additional_metadata` map) become
+    /// additional metadata, sorted by key; string values are kept verbatim and other
+    /// values as JSON text. `Media` stays out because the uploader writes it from its
+    /// own typed field, so feeding it back as additional metadata would duplicate it.
+    pub(crate) fn from_extended_attributes(xattr: crate::api::attr::ExtendedAttributes) -> Self {
+        let crate::api::attr::ExtendedAttributes {
+            common,
+            additional_metadata,
+            ..
+        } = xattr;
+        let mut additional: Vec<AdditionalMetadataProperty> = additional_metadata
+            .into_iter()
+            .map(|(key, value)| AdditionalMetadataProperty {
+                key,
+                value: match value {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                },
+            })
+            .collect();
+        additional.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let (size, modification_time, block_sizes, sha1) = match common {
+            Some(c) => (
+                c.size,
+                c.modification_time,
+                c.block_sizes.filter(|s| !s.is_empty()),
+                c.digests.and_then(|d| d.sha1),
+            ),
+            None => (None, None, None, None),
+        };
+
+        Self {
+            size,
+            modification_time,
+            sha1,
+            block_sizes,
+            additional_metadata: (!additional.is_empty()).then_some(additional),
+        }
+    }
+
+    /// Decrypts a revision XAttr with the node key, verifies its signature against the
+    /// content authorship claim, and parses it. A failed signature verification is
+    /// logged and the claimed values are still returned, matching the official SDKs.
+    pub(crate) fn decrypt(
+        message: &PgpArmoredMessage,
+        node_key: &crate::pgp::PgpPrivateKey,
+        authorship_claim: &crate::node::authorship::AuthorshipClaim,
+    ) -> anyhow::Result<Self> {
+        let (bytes, _, verification_failure) = crate::node::crypto::NodeCrypto::decrypt_message(
+            message,
+            None,
+            [node_key],
+            authorship_claim,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to decrypt revision extended attributes: {e}"))?;
+        if verification_failure.is_some() {
+            tracing::warn!(
+                author = ?authorship_claim.author.email_address,
+                "revision extended attributes signature verification failed"
+            );
+        }
+        let xattr: crate::api::attr::ExtendedAttributes = serde_json::from_slice(&bytes)
+            .context("failed to parse revision extended attributes")?;
+        Ok(Self::from_extended_attributes(xattr))
+    }
+
+    /// Like [`Self::decrypt`], but returns `None` when the XAttr is absent, and logs a
+    /// warning and returns `None` when it cannot be decrypted or parsed.
+    pub(crate) fn decrypt_optional(
+        message: Option<&PgpArmoredMessage>,
+        node_key: &crate::pgp::PgpPrivateKey,
+        authorship_claim: &crate::node::authorship::AuthorshipClaim,
+        revision_uid: &RevisionUid,
+    ) -> Option<Self> {
+        let message = message?;
+        match Self::decrypt(message, node_key, authorship_claim) {
+            Ok(attributes) => Some(attributes),
+            Err(error) => {
+                tracing::warn!(
+                    revision = %revision_uid,
+                    error = %format!("{error:#}"),
+                    "ignoring unreadable revision extended attributes"
+                );
+                None
+            }
+        }
+    }
+}
+
+impl Revision {
+    /// Builds the active revision of a decoded file node. Claimed values come from the
+    /// revision XAttr; when it is absent or unreadable, the size falls back to the
+    /// encrypted size and the modification time to the revision creation time.
+    pub(crate) fn from_active_revision_dto(
+        node_uid: &NodeUid,
+        dto: Option<&crate::api::revision::ActiveRevisionDto>,
+        node_key: &crate::pgp::PgpPrivateKey,
+        authorship_claim: &crate::node::authorship::AuthorshipClaim,
+    ) -> Self {
+        let uid = RevisionUid::new(
+            node_uid.clone(),
+            dto.map(|r| r.id.clone()).unwrap_or_default(),
+        );
+        let creation_time = dto.map(|r| r.creation_time).unwrap_or_else(Utc::now);
+        let size_on_cloud_storage = dto.map(|r| r.storage_quota_consumption).unwrap_or(0);
+        let claimed = dto
+            .and_then(|r| {
+                ClaimedRevisionAttributes::decrypt_optional(
+                    r.extended_attributes.as_ref(),
+                    node_key,
+                    authorship_claim,
+                    &uid,
+                )
+            })
+            .unwrap_or_default();
+        let thumbnails = dto
+            .map(|r| {
+                #[allow(deprecated)]
+                r.thumbnails
+                    .iter()
+                    .map(|t| ThumbnailHeader {
+                        id: t.id.clone(),
+                        r#type: t.r#type as i32,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self {
+            uid,
+            creation_time,
+            size_on_cloud_storage,
+            claimed_size: Some(claimed.size.unwrap_or(size_on_cloud_storage)),
+            claimed_digests: FileContentDigests { sha1: claimed.sha1 },
+            claimed_modification_time: Some(claimed.modification_time.unwrap_or(creation_time)),
+            thumbnails,
+            additional_claimed_metadata: claimed.additional_metadata,
+            content_author: Some(authorship_claim.to_potential_author()),
+            claimed_block_sizes: claimed.block_sizes,
+        }
     }
 }
 
@@ -790,5 +950,186 @@ impl RevisionWriter {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::CryptoGenerator;
+    use crate::node::authorship::AuthorshipClaim;
+    use crate::pgp::PgpPrivateKey;
+    use chrono::TimeZone;
+
+    /// Encrypts and signs extended attributes the way `RevisionWriter` does on commit.
+    fn encrypt_like_uploader(
+        xattr: &crate::api::attr::ExtendedAttributes,
+        node_key: &PgpPrivateKey,
+        signing_key: &PgpPrivateKey,
+    ) -> PgpArmoredMessage {
+        let xattr_json = serde_json::to_vec(xattr).unwrap();
+        let result = Encryptor::default()
+            .with_encryption_key(node_key.0.as_public_key())
+            .with_signing_key(&signing_key.0)
+            .encrypt(&xattr_json)
+            .unwrap();
+        PgpArmoredMessage(String::from_utf8(result.armor().unwrap()).unwrap())
+    }
+
+    fn uploader_xattr(mtime: DateTime<Utc>) -> crate::api::attr::ExtendedAttributes {
+        let mut additional_metadata = std::collections::HashMap::new();
+        for prop in [AdditionalMetadataProperty {
+            key: "pdmount.mode".into(),
+            value: "33188".into(),
+        }] {
+            additional_metadata.insert(prop.key, serde_json::Value::String(prop.value));
+        }
+        crate::api::attr::ExtendedAttributes {
+            common: Some(crate::api::attr::CommonExtendedAttributes {
+                size: Some(5_000_123),
+                modification_time: Some(mtime),
+                block_sizes: Some(vec![4_194_304, 805_819]),
+                digests: Some(crate::api::file::FileContentDigestsDto {
+                    sha1: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                }),
+            }),
+            media: None,
+            additional_metadata,
+        }
+    }
+
+    fn active_revision_dto(
+        xattr: Option<&PgpArmoredMessage>,
+    ) -> crate::api::revision::ActiveRevisionDto {
+        serde_json::from_value(serde_json::json!({
+            "RevisionID": "revision",
+            "CreateTime": 1_700_000_000,
+            "EncryptedSize": 5_100_000,
+            "Thumbnails": [],
+            "XAttr": xattr.map(|m| m.0.clone()),
+            "SignatureEmail": "member@example.test",
+        }))
+        .unwrap()
+    }
+
+    fn claim_for(signer: &PgpPrivateKey) -> AuthorshipClaim {
+        AuthorshipClaim {
+            keys: vec![signer.0.as_public_key().clone()],
+            author: Author {
+                email_address: Some("member@example.test".into()),
+            },
+            key_retrieval_error_message: None,
+        }
+    }
+
+    #[test]
+    fn active_revision_takes_claimed_values_from_uploader_xattr() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let address_key = CryptoGenerator::generate_private_key().unwrap();
+        let mtime = Utc.timestamp_opt(1_650_000_000, 0).unwrap();
+        let message = encrypt_like_uploader(&uploader_xattr(mtime), &node_key, &address_key);
+        let dto = active_revision_dto(Some(&message));
+        let node_uid = NodeUid::from_parts("volume", "node");
+
+        let revision = Revision::from_active_revision_dto(
+            &node_uid,
+            Some(&dto),
+            &node_key,
+            &claim_for(&address_key),
+        );
+
+        assert_eq!(revision.uid.to_string(), "volume~node~revision");
+        assert_eq!(revision.size_on_cloud_storage, 5_100_000);
+        assert_eq!(revision.claimed_size, Some(5_000_123));
+        assert_eq!(revision.claimed_modification_time, Some(mtime));
+        assert_eq!(
+            revision.claimed_digests.sha1,
+            Some(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        assert_eq!(revision.claimed_block_sizes, Some(vec![4_194_304, 805_819]));
+        let metadata = revision.additional_claimed_metadata.unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].key, "pdmount.mode");
+        assert_eq!(metadata[0].value, "33188");
+    }
+
+    #[test]
+    fn active_revision_without_xattr_keeps_fallback_values() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let dto = active_revision_dto(None);
+        let revision = Revision::from_active_revision_dto(
+            &NodeUid::from_parts("volume", "node"),
+            Some(&dto),
+            &node_key,
+            &claim_for(&node_key),
+        );
+
+        assert_eq!(revision.claimed_size, Some(5_100_000));
+        assert_eq!(revision.claimed_modification_time, Some(dto.creation_time));
+        assert_eq!(revision.claimed_digests.sha1, None);
+        assert_eq!(revision.claimed_block_sizes, None);
+        assert!(revision.additional_claimed_metadata.is_none());
+    }
+
+    #[test]
+    fn unreadable_xattr_keeps_fallback_values_instead_of_failing() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let other_key = CryptoGenerator::generate_private_key().unwrap();
+        let mtime = Utc.timestamp_opt(1_650_000_000, 0).unwrap();
+        // Encrypted to a different key: decryption with the node key fails.
+        let wrong_key = encrypt_like_uploader(&uploader_xattr(mtime), &other_key, &other_key);
+        let garbage = PgpArmoredMessage("invalid".into());
+        for message in [wrong_key, garbage] {
+            let dto = active_revision_dto(Some(&message));
+            let revision = Revision::from_active_revision_dto(
+                &NodeUid::from_parts("volume", "node"),
+                Some(&dto),
+                &node_key,
+                &claim_for(&node_key),
+            );
+            assert_eq!(revision.claimed_size, Some(5_100_000));
+            assert_eq!(revision.claimed_modification_time, Some(dto.creation_time));
+            assert_eq!(revision.claimed_block_sizes, None);
+        }
+    }
+
+    #[test]
+    fn signature_mismatch_still_returns_claimed_values() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let signer = CryptoGenerator::generate_private_key().unwrap();
+        let unrelated = CryptoGenerator::generate_private_key().unwrap();
+        let mtime = Utc.timestamp_opt(1_650_000_000, 0).unwrap();
+        let message = encrypt_like_uploader(&uploader_xattr(mtime), &node_key, &signer);
+
+        let claimed =
+            ClaimedRevisionAttributes::decrypt(&message, &node_key, &claim_for(&unrelated))
+                .unwrap();
+
+        assert_eq!(claimed.size, Some(5_000_123));
+        assert_eq!(claimed.modification_time, Some(mtime));
+    }
+
+    #[test]
+    fn non_string_additional_metadata_is_kept_as_json_text() {
+        let xattr: crate::api::attr::ExtendedAttributes =
+            serde_json::from_value(serde_json::json!({
+                "Common": {"Size": 1, "BlockSizes": []},
+                "Media": {"Width": 10},
+                "Location": {"Latitude": 1.5},
+                "pdmount.uid": "1000"
+            }))
+            .unwrap();
+        let claimed = ClaimedRevisionAttributes::from_extended_attributes(xattr);
+        assert_eq!(claimed.size, Some(1));
+        assert_eq!(claimed.block_sizes, None);
+        let metadata = claimed.additional_metadata.unwrap();
+        let pairs: Vec<_> = metadata
+            .iter()
+            .map(|p| (p.key.as_str(), p.value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("Location", r#"{"Latitude":1.5}"#), ("pdmount.uid", "1000")]
+        );
     }
 }

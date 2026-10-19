@@ -763,10 +763,9 @@ impl ProtonDriveClient {
     /// Returns all non-draft revisions for the given file, decrypting extended attributes
     /// (size, modification time, SHA1 digest) with the node key where possible.
     pub async fn iterate_revisions(&self, node_uid: NodeUid) -> anyhow::Result<Vec<RevisionInfo>> {
-        use crate::api::attr::ExtendedAttributes;
         use crate::author::Author;
         use crate::node::authorship::AuthorshipClaim;
-        use crate::node::crypto::NodeCrypto;
+        use crate::node::revision::ClaimedRevisionAttributes;
 
         let secrets = FileOperations::get_secrets(self, node_uid.clone()).await?;
         let node_key = secrets.base.key;
@@ -789,38 +788,23 @@ impl ProtonDriveClient {
                 continue;
             }
 
-            let (claimed_size, claimed_modification_time, claimed_sha1) = if let Some(xattr_msg) =
-                &dto.extended_attributes
-            {
-                match NodeCrypto::decrypt_message(xattr_msg, None, [&node_key], &authorship_claim) {
-                    Ok((bytes, _, _)) => {
-                        if let Ok(xattr) = serde_json::from_slice::<ExtendedAttributes>(&bytes) {
-                            let common = xattr.common.as_ref();
-                            (
-                                common.and_then(|c| c.size),
-                                common.and_then(|c| c.modification_time),
-                                common
-                                    .and_then(|c| c.digests.as_ref())
-                                    .and_then(|d| d.sha1.clone()),
-                            )
-                        } else {
-                            (None, None, None)
-                        }
-                    }
-                    Err(_) => (None, None, None),
-                }
-            } else {
-                (None, None, None)
-            };
+            let uid = RevisionUid::new(node_uid.clone(), dto.id);
+            let claimed = ClaimedRevisionAttributes::decrypt_optional(
+                dto.extended_attributes.as_ref(),
+                &node_key,
+                &authorship_claim,
+                &uid,
+            )
+            .unwrap_or_default();
 
             results.push(RevisionInfo {
-                uid: RevisionUid::new(node_uid.clone(), dto.id),
+                uid,
                 state: dto.state,
                 creation_time: dto.creation_time,
                 size_on_cloud_storage: dto.size,
-                claimed_size,
-                claimed_modification_time,
-                claimed_sha1,
+                claimed_size: claimed.size,
+                claimed_modification_time: claimed.modification_time,
+                claimed_sha1: claimed.sha1,
             });
         }
 
