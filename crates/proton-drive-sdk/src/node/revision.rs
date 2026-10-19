@@ -284,7 +284,7 @@ pub struct RevisionWriter {
     block_number: i32,
     digests: Vec<u8>,
     block_sizes: Vec<i32>,
-    thumbnail_digests: Vec<u8>,
+    thumbnail_digests: Vec<(crate::node::thumbnail::ThumbnailType, Vec<u8>)>,
     sha1_hasher: sha1::Sha1,
     /// Pre-computed SHA1 hash from pipelined write (set by producer task)
     precomputed_sha1: Option<[u8; 20]>,
@@ -626,7 +626,7 @@ impl RevisionWriter {
                 )
                 .await?;
 
-            self.thumbnail_digests.extend_from_slice(&hash_digest);
+            self.thumbnail_digests.push((thumb_type, hash_digest));
         }
 
         Ok(())
@@ -644,9 +644,14 @@ impl RevisionWriter {
             block_sizes = ?self.block_sizes,
             "Committing revision"
         );
-        let mut manifest = Vec::with_capacity(self.thumbnail_digests.len() + self.digests.len());
-        manifest.extend_from_slice(&self.thumbnail_digests);
-        manifest.extend_from_slice(&self.digests);
+        // Thumbnail digests ordered by type, then block digests in index order, as
+        // the downloader rebuilds it in RevisionReader::verify_manifest.
+        let manifest = crate::node::download::build_revision_manifest(
+            self.thumbnail_digests
+                .iter()
+                .map(|(thumbnail_type, digest)| (*thumbnail_type, digest.as_slice())),
+            std::iter::once(self.digests.as_slice()),
+        );
         let manifest_signature = self.draft.signing_key.sign_detached_armored(&manifest)?;
 
         // Use precomputed SHA1 from pipelined write, or fall back to hasher
