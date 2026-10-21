@@ -272,6 +272,46 @@ pub fn node_web_url(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn in_batches_sends_one_request_per_batch() {
+        let ids: Vec<LinkId> = (0..120).map(|i| LinkId::new(format!("link{i}"))).collect();
+        let mut sizes = Vec::new();
+        let batches = in_batches(ids.clone(), FRESH_NODES_BATCH_SIZE, |batch| {
+            sizes.push(batch.len());
+            async move { Ok(batch) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(sizes, [50, 50, 20]);
+        assert_eq!(batches.concat(), ids);
+    }
+
+    #[tokio::test]
+    async fn in_batches_sends_nothing_for_no_ids() {
+        let mut calls = 0;
+        let batches: Vec<()> = in_batches(Vec::new(), FRESH_NODES_BATCH_SIZE, |_| {
+            calls += 1;
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert!(batches.is_empty());
+        assert_eq!(calls, 0);
+    }
+
+    #[tokio::test]
+    async fn in_batches_stops_at_the_first_error() {
+        let ids: Vec<LinkId> = (0..120).map(|i| LinkId::new(format!("link{i}"))).collect();
+        let mut calls = 0;
+        let result: anyhow::Result<Vec<()>> = in_batches(ids, FRESH_NODES_BATCH_SIZE, |_| {
+            calls += 1;
+            async { anyhow::bail!("429") }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
     #[test]
     fn from_parts_round_trips() {
         let uid = NodeUid::from_parts("vol", "link");
@@ -858,6 +898,24 @@ pub struct OwnedBy {
     pub organisation: Option<String>,
 }
 
+/// Most links per `get_details` request when nodes are fetched in bulk: the C# SDK's
+/// `BatchLoaderBase` default (the JS SDK sends up to 100).
+pub const FRESH_NODES_BATCH_SIZE: usize = 50;
+
+/// Runs `load` once per consecutive batch of at most `size` ids, one batch after the
+/// other, and returns the results in order. No ids, no calls.
+async fn in_batches<T, F, Fut>(ids: Vec<LinkId>, size: usize, mut load: F) -> anyhow::Result<Vec<T>>
+where
+    F: FnMut(Vec<LinkId>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut results = Vec::with_capacity(ids.len().div_ceil(size));
+    for batch in ids.chunks(size) {
+        results.push(load(batch.to_vec()).await?);
+    }
+    Ok(results)
+}
+
 pub struct DtoToMetadataConverter;
 
 impl DtoToMetadataConverter {
@@ -891,7 +949,60 @@ impl DtoToMetadataConverter {
         )
         .await?;
 
-        // Cache the metadata and secrets
+        Self::cache_node_metadata(client, &metadata).await?;
+        Ok(metadata)
+    }
+
+    /// Fetches the given links of one volume again from the API, bypassing and then
+    /// refreshing the entity cache, with one `get_details` request per
+    /// [`FRESH_NODES_BATCH_SIZE`] links, as the C# SDK's batch loader does. The cache
+    /// entries of all given links are evicted first, so links the API no longer
+    /// returns (deleted for good) leave no stale entry; they are missing from the result.
+    pub async fn get_fresh_nodes_metadata(
+        client: &ProtonDriveClient,
+        volume_id: VolumeId,
+        link_ids: Vec<LinkId>,
+    ) -> anyhow::Result<Vec<NodeMetadataResult>> {
+        let entities = client.cache().entities();
+        for link_id in &link_ids {
+            let _ = entities
+                .remove_node(crate::node::NodeUid::new(
+                    volume_id.clone(),
+                    link_id.clone(),
+                ))
+                .await;
+        }
+        let api = client.api();
+        let links = api.links();
+        let batches = in_batches(link_ids, FRESH_NODES_BATCH_SIZE, |batch| {
+            links.get_details(volume_id.clone(), batch)
+        })
+        .await?;
+
+        let mut results = Vec::new();
+        for response in batches {
+            for link_details in response.links {
+                let parent_key =
+                    Self::resolve_parent_key(client, volume_id.clone(), &link_details).await?;
+                let metadata = Self::convert_dto_to_node_metadata_with_client(
+                    client,
+                    volume_id.clone(),
+                    link_details,
+                    parent_key.as_ref(),
+                )
+                .await?;
+                Self::cache_node_metadata(client, &metadata).await?;
+                results.push(metadata);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Stores a freshly decoded node and its secrets in the client's caches.
+    async fn cache_node_metadata(
+        client: &ProtonDriveClient,
+        metadata: &NodeMetadataResult,
+    ) -> anyhow::Result<()> {
         if let PotentialObject::Node(m) = &metadata {
             client
                 .cache()
@@ -927,7 +1038,7 @@ impl DtoToMetadataConverter {
             }
         }
 
-        Ok(metadata)
+        Ok(())
     }
 
     async fn resolve_parent_key(

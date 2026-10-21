@@ -541,6 +541,23 @@ impl ProtonDriveClient {
         NodeOperations::get_node(self, node_uid).await
     }
 
+    /// Like `get_node_uncached` for many nodes of one volume, with one API request per
+    /// [`crate::node::FRESH_NODES_BATCH_SIZE`] links instead of one per node: evicts the
+    /// nodes' cache entries, fetches them fresh and caches the result. Use it for the
+    /// nodes named by a page of events. Links the API does not return (deleted) are
+    /// missing from the result, which is in no particular order.
+    pub async fn get_nodes_uncached(
+        &self,
+        volume_id: VolumeId,
+        link_ids: Vec<LinkId>,
+    ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
+        let metadata = crate::node::DtoToMetadataConverter::get_fresh_nodes_metadata(
+            self, volume_id, link_ids,
+        )
+        .await?;
+        Ok(metadata.into_iter().map(|m| m.to_node_result()).collect())
+    }
+
     /// Fetch and decrypt a thumbnail block belonging to the file identified by
     /// `node_uid`.  `thumbnail_id` is the server-assigned ID stored in the
     /// node's `Revision.thumbnails` list.  Returns the raw (decrypted) image
