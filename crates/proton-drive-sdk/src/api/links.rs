@@ -438,7 +438,10 @@ pub struct LinkDto {
     #[serde(with = "crate::utils::serde::epoch_seconds")]
     pub modification_time: DateTime<Utc>,
 
-    #[serde(rename = "Trashed")]
+    /// `TrashTime` in the v2 links API that fills this DTO
+    /// (`cs/client/js/src/internal/apiService/driveTypes.ts`, `LinkDto`);
+    /// the v1 link transformer calls it `Trashed`.
+    #[serde(rename = "TrashTime", alias = "Trashed")]
     #[serde(default, with = "crate::utils::serde::epoch_seconds_opt")]
     pub trash_time: Option<DateTime<Utc>>,
 
@@ -638,6 +641,31 @@ pub struct RenameLinkRequest {
     #[serde(rename = "OriginalHash")]
     #[serde(with = "crate::utils::serde::forgiving_hex_bytes")]
     pub original_name_hash_digest: Vec<u8>,
+}
+
+#[cfg(test)]
+mod link_dto_tests {
+    use super::*;
+
+    fn link(trash: &str) -> LinkDto {
+        serde_json::from_str(&format!(
+            r#"{{"LinkID":"link","Type":2,"ParentLinkID":"parent","State":2,
+                "CreateTime":1700000000,"ModifyTime":1700000001,{trash}
+                "Name":"name","NameHash":"ab","NodeKey":"key","NodePassphrase":"passphrase",
+                "NodePassphraseSignature":null,"SignatureEmail":null,
+                "NameSignatureEmail":null,"MIMEType":null,"OwnedBy":null}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn trash_time_is_read_from_the_v2_field() {
+        let trashed = DateTime::<Utc>::from_timestamp(1_792_656_000, 0);
+        assert_eq!(link(r#""TrashTime":1792656000,"#).trash_time, trashed);
+        assert_eq!(link(r#""Trashed":1792656000,"#).trash_time, trashed);
+        assert_eq!(link(r#""TrashTime":null,"#).trash_time, None);
+        assert_eq!(link("").trash_time, None);
+    }
 }
 
 #[cfg(test)]
