@@ -218,7 +218,7 @@ impl NodeOperations {
         }
 
         if uids.len() == 1 {
-            return Self::move_single(client, uids[0].clone(), new_parent_uid, None).await;
+            return Self::move_single(client, uids[0].clone(), new_parent_uid, None, None).await;
         }
 
         let membership_address = Self::get_membership_address(client, &new_parent_uid).await?;
@@ -358,11 +358,18 @@ impl NodeOperations {
         Ok(())
     }
 
+    /// Moves `uid` into `new_parent_uid`, renamed to `new_name` if given.
+    ///
+    /// The request carries the node's current name hash as `OriginalHash`, which the server
+    /// compares with the stored one. With `original_name_hash` set, that value is sent instead
+    /// of the hash just fetched, so a caller can make the move conditional on the name it last
+    /// saw; otherwise a concurrent rename by another client is silently overwritten.
     pub async fn move_single(
         client: &ProtonDriveClient,
         uid: NodeUid,
         new_parent_uid: NodeUid,
         new_name: Option<String>,
+        original_name_hash: Option<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let membership_address = Self::get_membership_address(client, &new_parent_uid).await?;
         let signing_key = client
@@ -393,6 +400,7 @@ impl NodeOperations {
                 .await?;
         let (node, node_and_secrets, _membership_share_id, origin_name_hash_digest) =
             metadata_result.clone().result()?.deconstruct();
+        let origin_name_hash_digest = original_name_hash.unwrap_or(origin_name_hash_digest);
         let secrets = match node_and_secrets {
             crate::node::NodeAndSecrets::File(_, s) => s.base,
             crate::node::NodeAndSecrets::Folder(_, s) => s.base,
@@ -570,17 +578,20 @@ impl NodeOperations {
         Ok(response.link_id)
     }
 
+    /// Renames `uid` within its parent. `original_name_hash` works as in [`Self::move_single`].
     pub async fn rename(
         client: &ProtonDriveClient,
         uid: NodeUid,
         new_name: String,
         new_media_type: Option<String>,
+        original_name_hash: Option<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let metadata_result =
             crate::node::DtoToMetadataConverter::get_fresh_node_metadata(client, uid.clone(), None)
                 .await?;
         let (node, node_and_secrets, _, original_name_hash_digest) =
             metadata_result.clone().result()?.deconstruct();
+        let original_name_hash_digest = original_name_hash.unwrap_or(original_name_hash_digest);
         let _secrets = match node_and_secrets {
             crate::node::NodeAndSecrets::File(_, s) => s.base,
             crate::node::NodeAndSecrets::Folder(_, s) => s.base,

@@ -573,11 +573,33 @@ impl ProtonDriveClient {
         volume_id: VolumeId,
         link_ids: Vec<LinkId>,
     ) -> anyhow::Result<Vec<PotentialObject<Node, DegradedNode>>> {
+        Ok(self
+            .get_nodes_uncached_with_name_hashes(volume_id, link_ids)
+            .await?
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect())
+    }
+
+    /// [`Self::get_nodes_uncached`], with each node's name hash: the HMAC of its name under
+    /// the parent folder's hash key, which the API calls `Hash` / `NameHash`. Pass it to
+    /// [`Self::rename_node_with_original_hash`] or [`Self::move_node_with_original_hash`].
+    pub async fn get_nodes_uncached_with_name_hashes(
+        &self,
+        volume_id: VolumeId,
+        link_ids: Vec<LinkId>,
+    ) -> anyhow::Result<Vec<(PotentialObject<Node, DegradedNode>, Vec<u8>)>> {
         let metadata = crate::node::DtoToMetadataConverter::get_fresh_nodes_metadata(
             self, volume_id, link_ids,
         )
         .await?;
-        Ok(metadata.into_iter().map(|m| m.to_node_result()).collect())
+        Ok(metadata
+            .into_iter()
+            .map(|m| {
+                let name_hash = m.name_hash_digest().to_vec();
+                (m.to_node_result(), name_hash)
+            })
+            .collect())
     }
 
     /// Fetch and decrypt a thumbnail block belonging to the file identified by
@@ -1029,7 +1051,28 @@ impl ProtonDriveClient {
         new_parent_folder_uid: NodeUid,
         new_name: Option<String>,
     ) -> anyhow::Result<()> {
-        NodeOperations::move_single(self, uid, new_parent_folder_uid, new_name).await
+        NodeOperations::move_single(self, uid, new_parent_folder_uid, new_name, None).await
+    }
+
+    /// Like [`Self::move_node`], but the move succeeds only while the node's name hash is still
+    /// `original_name_hash` (as returned by [`Self::get_nodes_uncached_with_name_hashes`]): the
+    /// server checks it against the stored hash, so a concurrent rename by another client is
+    /// detected instead of overwritten.
+    pub async fn move_node_with_original_hash(
+        &self,
+        uid: NodeUid,
+        new_parent_folder_uid: NodeUid,
+        new_name: Option<String>,
+        original_name_hash: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        NodeOperations::move_single(
+            self,
+            uid,
+            new_parent_folder_uid,
+            new_name,
+            Some(original_name_hash),
+        )
+        .await
     }
 
     /// Moves nodes concurrently and yields each independent result as soon as it completes.
@@ -1049,7 +1092,8 @@ impl ProtonDriveClient {
                     let parent = new_parent_folder_uid.clone();
                     async move {
                         let result =
-                            NodeOperations::move_single(&client, uid.clone(), parent, None).await;
+                            NodeOperations::move_single(&client, uid.clone(), parent, None, None)
+                                .await;
                         NodeMoveResult { uid, result }
                     }
                 })
@@ -1082,7 +1126,26 @@ impl ProtonDriveClient {
         new_name: String,
         new_media_type: Option<String>,
     ) -> anyhow::Result<()> {
-        NodeOperations::rename(self, uid, new_name, new_media_type).await
+        NodeOperations::rename(self, uid, new_name, new_media_type, None).await
+    }
+
+    /// Like [`Self::rename_node`], but conditional on the node's name hash still being
+    /// `original_name_hash`, as in [`Self::move_node_with_original_hash`].
+    pub async fn rename_node_with_original_hash(
+        &self,
+        uid: NodeUid,
+        new_name: String,
+        new_media_type: Option<String>,
+        original_name_hash: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        NodeOperations::rename(
+            self,
+            uid,
+            new_name,
+            new_media_type,
+            Some(original_name_hash),
+        )
+        .await
     }
 
     /// Moves the given nodes to the trash. Returns a per-node result map.
@@ -1503,6 +1566,41 @@ mod move_result_tests {
             )
         }
         let _ = move_and_rename;
+    }
+
+    #[test]
+    fn conditional_rename_and_move_take_the_original_name_hash() {
+        fn rename(
+            client: &ProtonDriveClient,
+        ) -> impl std::future::Future<Output = anyhow::Result<()>> + '_ {
+            client.rename_node_with_original_hash(
+                NodeUid::from_parts("volume", "node"),
+                "renamed.txt".into(),
+                None,
+                vec![0xab; 32],
+            )
+        }
+        fn move_and_rename(
+            client: &ProtonDriveClient,
+        ) -> impl std::future::Future<Output = anyhow::Result<()>> + '_ {
+            client.move_node_with_original_hash(
+                NodeUid::from_parts("volume", "node"),
+                NodeUid::from_parts("volume", "target"),
+                Some("renamed.txt".into()),
+                vec![0xab; 32],
+            )
+        }
+        let _ = (rename, move_and_rename);
+    }
+
+    #[tokio::test]
+    async fn fetching_no_nodes_with_name_hashes_sends_nothing() {
+        let (client, _) = crate::test_support::client().await;
+        let nodes = client
+            .get_nodes_uncached_with_name_hashes(VolumeId::new("volume".into()), Vec::new())
+            .await
+            .unwrap();
+        assert!(nodes.is_empty());
     }
 
     #[test]

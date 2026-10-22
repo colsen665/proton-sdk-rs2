@@ -276,6 +276,7 @@ impl DeviceOperations {
             root_uid.clone(),
             new_name.clone(),
             None,
+            None,
         )
         .await?;
 
