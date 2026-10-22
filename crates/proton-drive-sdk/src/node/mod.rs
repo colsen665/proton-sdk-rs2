@@ -643,6 +643,14 @@ impl NodeMetadataResult {
         }
     }
 
+    /// The node's name hash (`Hash` in the API), decoded or not.
+    pub fn name_hash_digest(&self) -> &[u8] {
+        match self {
+            PotentialObject::Node(m) => &m.name_hash_digest,
+            PotentialObject::Degraded(m) => &m.name_hash_digest,
+        }
+    }
+
     pub fn to_node_result(self) -> PotentialObject<Node, DegradedNode> {
         match self {
             PotentialObject::Node(m) => PotentialObject::Node(m.node()),
