@@ -223,8 +223,6 @@ impl ProtonAccountClient {
                 continue;
             };
 
-            log::debug!("Passphrase: {:?}", String::from_utf8(passphrase.to_vec()));
-
             let unlocked_user_key =
                 PrivateKey::import(key.private_key.as_bytes(), &passphrase, DataEncoding::Auto)?;
             unlocked.push(unlocked_user_key);

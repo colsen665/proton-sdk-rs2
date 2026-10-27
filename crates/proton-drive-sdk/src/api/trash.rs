@@ -92,12 +92,7 @@ impl TrashApiClient for DefaultTrashApiClient {
             Ok(r) => Ok(r),
             Err(e) => {
                 tracing::error!(error = %e, "get_trash failed to deserialize");
-                tracing::debug!(body = %text, "Full response");
-                Err(anyhow::anyhow!(
-                    "Failed to decode Trash response: {}. Body: {}",
-                    e,
-                    text
-                ))
+                Err(anyhow::anyhow!("Failed to decode Trash response: {}", e))
             }
         }
     }
@@ -118,7 +113,6 @@ impl TrashApiClient for DefaultTrashApiClient {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "trash_multiple failed to deserialize");
-                tracing::debug!(body = %text, "Full response");
                 return Err(e.into());
             }
         };
