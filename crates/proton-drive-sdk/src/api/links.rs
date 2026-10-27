@@ -155,7 +155,6 @@ impl LinksApiClient for DefaultLinksApiClient {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "LinkDetailsResponse failed to deserialize");
-                tracing::debug!(body = %text, "Full response");
                 return Err(e.into());
             }
         };
@@ -190,14 +189,12 @@ impl LinksApiClient for DefaultLinksApiClient {
             link_id.raw()
         ))?;
 
-        let request_json = serde_json::to_string(&request)?;
-        tracing::debug!(url = %url, body = %request_json, "Sending move_link request");
+        tracing::debug!(url = %url, "Sending move_link request");
 
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
         let response = builder.send().await?;
         let text = response.text().await?;
-        tracing::debug!(body = %text, "move_link response received");
 
         let api_response = serde_json::from_str::<ApiResponse>(&text)?;
         api_response.to_result()?;
@@ -213,14 +210,12 @@ impl LinksApiClient for DefaultLinksApiClient {
             .base_url
             .join(&format!("volumes/{}/links/move-multiple", volume_id.raw()))?;
 
-        let request_json = serde_json::to_string(&request)?;
-        tracing::debug!(url = %url, body = %request_json, "Sending move_multiple request");
+        tracing::debug!(url = %url, "Sending move_multiple request");
 
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
         let response = builder.send().await?;
         let text = response.text().await?;
-        tracing::debug!(body = %text, "move_multiple response received");
 
         let api_response = serde_json::from_str::<ApiResponse>(&text)?;
         api_response.to_result()?;
@@ -298,7 +293,6 @@ impl LinksApiClient for DefaultLinksApiClient {
         let builder = self.add_auth_headers(builder).await?;
         let response = builder.send().await?;
         let text = response.text().await?;
-        tracing::debug!(body = %text, "copy_link response received");
         let api_response = serde_json::from_str::<crate::api::ApiResponse>(&text)?;
         api_response.to_result()?;
         Ok(serde_json::from_str::<CopyLinkResponse>(&text)?)

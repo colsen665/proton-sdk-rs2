@@ -246,7 +246,6 @@ impl AccountSecretCache for DefaultAccountSecretCache {
     ) -> anyhow::Result<Option<Vec<PrivateKey>>> {
         let key = Self::get_address_keys_cache_key(address_id);
         let raw = self.repository.try_get(&key).await?;
-        log::debug!("raw: {:?}", raw);
         match raw {
             Some(value) => Ok(Some(Self::deserialize_private_keys(&value)?)),
             None => Ok(None),

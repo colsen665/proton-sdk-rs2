@@ -519,7 +519,6 @@ impl ProtonAPISession {
             true
         } else if probe_status.is_success() {
             let body_text = probe_response.text().await.unwrap_or_default();
-            log::debug!("ensure_authenticated probe body: {}", body_text);
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
                 let code = json.get("Code").and_then(|c| c.as_u64()).unwrap_or(1000);
                 code == 401

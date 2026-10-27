@@ -80,7 +80,6 @@ impl UsersApiClient for DefaultUsersApiClient {
                 .error_for_status()?
         };
         let body = response.bytes().await?;
-        log::debug!("body: {:#?}", body);
         Ok(serde_json::from_slice::<UserResponse>(&body)?)
     }
 }
