@@ -176,6 +176,24 @@ pub fn verify_manifest_signature(
         })
 }
 
+/// The keys a revision's manifest signature is verified with: the node key
+/// when the revision has no signature email address, and the address keys of
+/// that email otherwise (as `RevisionReader` in the C# SDK).
+pub(crate) async fn manifest_verification_keys(
+    client: &ProtonDriveClient,
+    signature_email_address: Option<&str>,
+    node_key: &PgpPrivateKey,
+) -> anyhow::Result<Vec<proton_rpgp::PublicKey>> {
+    match signature_email_address {
+        None | Some("") => Ok(vec![node_key.0.as_public_key().clone()]),
+        Some(email) => client
+            .account()
+            .get_address_public_keys(email)
+            .await
+            .map_err(|e| e.context("Failed to get manifest verification keys")),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FileContentsDecryptionException {
     #[error("Failed to decrypt file contents: {0}")]
@@ -710,7 +728,9 @@ impl RevisionReader {
     /// [`CompletedDownloadManifestVerificationException`] if any block is missing.
     /// Ranged and partial reads ([`Self::download_block_at`],
     /// `FileDownloader::download_range`) cannot verify the manifest; they rely on
-    /// the per-block hash check only.
+    /// the per-block hash check only. Reads through a
+    /// [`crate::node::file::block_map::BlockMap`] are covered: the map verifies
+    /// the signature over the listed hashes when it is built.
     ///
     /// The verification keys are the node key when the revision has no signature
     /// email address, and the address keys of that email otherwise.
@@ -735,15 +755,12 @@ impl RevisionReader {
             block_digests.iter().map(Vec::as_slice),
         );
 
-        let verification_keys = match revision.signature_email_address.as_deref() {
-            None | Some("") => vec![self.state.node_key.0.as_public_key().clone()],
-            Some(email) => self
-                .client
-                .account()
-                .get_address_public_keys(email)
-                .await
-                .map_err(|e| e.context("Failed to get manifest verification keys"))?,
-        };
+        let verification_keys = manifest_verification_keys(
+            &self.client,
+            revision.signature_email_address.as_deref(),
+            &self.state.node_key,
+        )
+        .await?;
 
         if let Err(error) = verify_manifest_signature(
             &manifest,
