@@ -1,5 +1,6 @@
 use crate::api::cache::{AccountClientCache, DefaultAccountClientCache};
 use crate::api::client::{AccountApiClients, DefaultAccountApiClients};
+use crate::api::response::AddressPublicKey;
 use crate::protobuf::{Address, AddressKey};
 use crate::session::ProtonAPISession;
 use proton_rpgp::{
@@ -153,7 +154,9 @@ impl ProtonAccountClient {
             .ok_or_else(|| anyhow::anyhow!("Address key index out of bounds"))
     }
 
-    /// Fetches and caches the active public keys for the given email address from the Keys API.
+    /// Fetches and caches the public keys that may verify signatures by the
+    /// given email address: the internal address's keys from the Keys API that
+    /// are not flagged compromised. Unverified keys (legacy, WKD) are left out.
     pub async fn get_address_public_keys(
         &self,
         email_address: &str,
@@ -169,7 +172,11 @@ impl ProtonAccountClient {
             .await?;
 
         let mut keys = Vec::new();
-        for key in response.address_public_keys {
+        let listed = response
+            .address
+            .map(|address| address.keys)
+            .unwrap_or_default();
+        for key in listed.into_iter().filter(AddressPublicKey::may_verify) {
             if let Some(armored) = key.public_key {
                 if let Ok(public_key) = PublicKey::import(armored.as_bytes(), DataEncoding::Auto) {
                     keys.push(public_key);
