@@ -270,9 +270,8 @@ impl SharesApiClient for DefaultSharesApiClient {
 
         let response = request.send().await?;
         let text = response.text().await?;
-        let res: ShareResponse = serde_json::from_str(&text).map_err(|e| {
-            anyhow::anyhow!("Failed to decode share response: {}", e)
-        })?;
+        let res: ShareResponse = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("Failed to decode share response: {}", e))?;
         Ok(res)
     }
 
