@@ -213,16 +213,28 @@ pub struct ModulusResponse {
     pub response: ApiResponse,
 }
 
+/// Answer of `GET core/v4/keys/all` (`get_core-{_version}-keys-all` in the
+/// API schema of the official JS SDK, `coreTypes.ts`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddressPublicKeyListResponse {
-    /// The email address these keys belong to, if echoed by the server.
+    /// The internal address's keys, backed by its signed key list.
     #[serde(rename = "Address", alias = "address", default)]
-    pub address: Option<String>,
-    /// Active public keys for the address, including flags and source metadata.
-    #[serde(rename = "AddressPublicKeys", alias = "address_public_keys", default)]
-    pub address_public_keys: Vec<AddressPublicKey>,
+    pub address: Option<AddressPublicKeys>,
+    /// The catch-all address's keys, if the address is caught by one.
+    #[serde(rename = "CatchAll", alias = "catch_all", default)]
+    pub catch_all: Option<AddressPublicKeys>,
+    /// Keys without trusted metadata (legacy, WKD): not for signature verification.
+    #[serde(rename = "Unverified", alias = "unverified", default)]
+    pub unverified: Option<AddressPublicKeys>,
     #[serde(flatten)]
     pub response: ApiResponse,
+}
+
+/// One address's key list in [`AddressPublicKeyListResponse`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AddressPublicKeys {
+    #[serde(rename = "Keys", alias = "keys", default)]
+    pub keys: Vec<AddressPublicKey>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,7 +242,8 @@ pub struct AddressPublicKey {
     /// Email address associated with this key.
     #[serde(rename = "Email", alias = "email", default)]
     pub email: Option<String>,
-    /// Bitfield indicating key capabilities (verify=1, encrypt=2).
+    /// Bitfield of key usage: 1 = not compromised (may verify), 2 = not
+    /// obsolete (may encrypt).
     #[serde(rename = "Flags", alias = "flags", default)]
     pub flags: Option<i32>,
     /// Armored PGP public key.
@@ -239,6 +252,17 @@ pub struct AddressPublicKey {
     /// Origin of the key: `0` = ProtonMail, `3` = external/WKD.
     #[serde(rename = "Source", alias = "source", default)]
     pub source: Option<i32>,
+}
+
+impl AddressPublicKey {
+    /// Key flag: the key is not compromised, so its signatures count.
+    pub const FLAG_NOT_COMPROMISED: i32 = 1;
+
+    /// Whether signatures by this key may be trusted.
+    pub fn may_verify(&self) -> bool {
+        self.flags
+            .is_none_or(|flags| flags & Self::FLAG_NOT_COMPROMISED != 0)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,4 +283,39 @@ pub struct KeySalt {
         deserialize_with = "deserialize_binary_bytes"
     )]
     pub value: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shape of `GET core/v4/keys/all` in the official API schema.
+    #[test]
+    fn all_keys_answer_decodes_the_address_keys() {
+        let json = r#"{
+            "Code": 1000,
+            "Address": {
+                "Keys": [
+                    {"PublicKey": "key-1", "Primary": 1, "Flags": 3, "Source": 0},
+                    {"PublicKey": "key-2", "Primary": 0, "Flags": 2, "Source": 0}
+                ],
+                "SignedKeyList": {"Data": "[]", "Signature": "sig"}
+            },
+            "CatchAll": null,
+            "Unverified": {"Keys": [{"PublicKey": "legacy", "Flags": 3, "Source": 1}]},
+            "Warnings": [],
+            "ProtonMX": true,
+            "IsProton": 0
+        }"#;
+
+        let response: AddressPublicKeyListResponse = serde_json::from_str(json).unwrap();
+
+        let keys = response.address.unwrap().keys;
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].public_key.as_deref(), Some("key-1"));
+        assert!(keys[0].may_verify());
+        assert!(!keys[1].may_verify(), "compromised");
+        assert!(response.catch_all.is_none());
+        assert_eq!(response.unverified.unwrap().keys.len(), 1);
+    }
 }
