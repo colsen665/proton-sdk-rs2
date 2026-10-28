@@ -45,6 +45,21 @@ impl TransferQueue {
         }
     }
 
+    /// Returns a queue that keeps this queue's file capacity (shared with it) and allows
+    /// `max_degree_of_parallelism` concurrent block transfers. The limit must be greater than
+    /// zero.
+    pub fn with_max_degree_of_parallelism(self, max_degree_of_parallelism: usize) -> Self {
+        assert!(
+            max_degree_of_parallelism > 0,
+            "transfer parallelism must be greater than zero"
+        );
+        Self {
+            block_semaphore: Arc::new(Semaphore::new(max_degree_of_parallelism)),
+            max_degree_of_parallelism,
+            ..self
+        }
+    }
+
     fn file_semaphore(max_concurrent_files: usize) -> Arc<Semaphore> {
         assert!(
             max_concurrent_files > 0,
@@ -116,6 +131,17 @@ mod tests {
         assert!(queue.file_semaphore.try_acquire().is_err());
         drop(permit);
         assert!(queue.file_semaphore.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn changing_the_block_parallelism_keeps_the_file_capacity() {
+        let queue = TransferQueue::with_limits(6, 2);
+        let lowered = queue.clone().with_max_degree_of_parallelism(1);
+        let _block = lowered.start_block().await.unwrap();
+        assert!(lowered.block_semaphore.try_acquire().is_err());
+        let _file = queue.start_file().await.unwrap();
+        let _second = lowered.start_file().await.unwrap();
+        assert!(lowered.file_semaphore.try_acquire().is_err());
     }
 
     #[tokio::test]
