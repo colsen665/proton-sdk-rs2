@@ -387,6 +387,28 @@ impl ProtonDriveClient {
         self
     }
 
+    /// Sets how many blocks may be transferred at once in each direction (uploads and downloads
+    /// are limited separately; thumbnails keep their own limit). The default is 6. The file limit
+    /// of [`Self::with_max_concurrent_file_transfers`] is kept, whichever is called first.
+    ///
+    /// Call this while building the client, before cloning it or starting transfers: clones made
+    /// earlier keep the previous limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is zero.
+    pub fn with_block_transfer_parallelism(mut self, limit: usize) -> Self {
+        self.block_uploader.queue = self
+            .block_uploader
+            .queue
+            .with_max_degree_of_parallelism(limit);
+        self.block_downloader.queue = self
+            .block_downloader
+            .queue
+            .with_max_degree_of_parallelism(limit);
+        self
+    }
+
     pub fn with_search_service_provider(
         mut self,
         provider: Arc<dyn crate::search::SearchServiceProvider>,
@@ -1521,6 +1543,30 @@ mod transfer_concurrency_tests {
         ] {
             let _first = queue.start_file().await.unwrap();
             let _second = queue.start_file().await.unwrap();
+            assert!(queue.start_file().now_or_never().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn block_transfer_parallelism_applies_to_uploads_and_downloads() {
+        let (client, _) = crate::test_support::client().await;
+        let client = client
+            .with_max_concurrent_file_transfers(4)
+            .with_block_transfer_parallelism(5);
+
+        for queue in [
+            &client.block_uploader().queue,
+            &client.block_downloader().queue,
+        ] {
+            let mut blocks = Vec::new();
+            for _ in 0..5 {
+                blocks.push(queue.start_block().await.unwrap());
+            }
+            assert!(queue.start_block().now_or_never().is_none());
+            let mut files = Vec::new();
+            for _ in 0..4 {
+                files.push(queue.start_file().await.unwrap());
+            }
             assert!(queue.start_file().now_or_never().is_none());
         }
     }
