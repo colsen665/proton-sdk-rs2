@@ -1,3 +1,6 @@
+# FORK
+If you ended up here you most likely should use **tirbofish/proton-sdk-rs2**
+
 # proton-sdk-rs2
 
 An unofficial Rust port of the Proton Drive SDK, plus **pdcli**, a GTK4 and FUSE Proton Drive client for Linux.
