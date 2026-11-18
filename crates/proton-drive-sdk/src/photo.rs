@@ -126,7 +126,10 @@ impl ProtonPhotosClient {
         let base_url = reqwest::Url::parse(&session.client_config.base_url.to_string())?
             .join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
         let photos_api = DefaultPhotosApiClient::new(
-            crate::server_time::client_with_server_time(http_client),
+            reqwest_middleware::ClientBuilder::new(http_client)
+                .with(crate::http::retry::DriveApiRetryMiddleware::default())
+                .with(crate::server_time::ServerTimeMiddleware)
+                .build(),
             base_url,
             Some(session.token_credential.clone()),
         );
