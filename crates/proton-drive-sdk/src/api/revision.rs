@@ -116,6 +116,10 @@ pub struct RevisionCreationRequest {
 
     #[serde(rename = "ClientUID")]
     pub client_id: Option<String>,
+
+    /// Plaintext size of the upload, for the server's early quota check.
+    #[serde(rename = "IntendedUploadSize")]
+    pub intended_upload_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
