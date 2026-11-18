@@ -188,6 +188,21 @@ impl TooManyRequestsException {
     }
 }
 
+/// A node's metadata or keys do not decrypt: a folder whose secrets are degraded, or a
+/// node whose name, passphrase or key cannot be decrypted. It comes from the node's data,
+/// not from the transport or the API, so asking again gives the same answer; a caller
+/// that reads many nodes at once can report this one degraded and go on with the others.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct UndecryptableNodeError(pub String);
+
+impl UndecryptableNodeError {
+    /// Whether `error`, or one of its causes, is an [`UndecryptableNodeError`].
+    pub fn is_cause_of(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+}
+
 pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     value.parse::<u64>().ok().map(Duration::from_secs)
