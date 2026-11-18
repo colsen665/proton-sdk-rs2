@@ -1,50 +1,79 @@
 use crate::api::block::verification::{
     BlockVerificationApiClient, DefaultBlockVerificationApiClient,
 };
+use crate::error::IntegrityException;
 use crate::node::revision::RevisionUid;
 use crate::pgp::{PgpPrivateKey, PgpSessionKey};
 use proton_sdk_rs2::auth::TokenCredential;
 use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
 
+/// Checks each encrypted block before it is uploaded, and computes the token the
+/// server checks it against.
+///
+/// The session key is the one the verification endpoint returns for the revision
+/// (its content key packet, decrypted with the node key), so a block encrypted with
+/// another key fails here instead of after the commit.
 #[derive(Clone)]
 pub struct BlockVerifier {
-    _session_key: PgpSessionKey,
+    session_key: PgpSessionKey,
     verification_code: Vec<u8>,
 }
 
 impl BlockVerifier {
     pub fn new(session_key: PgpSessionKey, verification_code: Vec<u8>) -> Self {
         Self {
-            _session_key: session_key,
+            session_key,
             verification_code,
         }
     }
 
+    /// How many bytes of the encrypted block go into the verification token.
     pub fn data_packet_prefix_max_length(&self) -> usize {
         self.verification_code.len()
     }
 
+    /// Decrypts the whole encrypted block with the verification session key and
+    /// compares the result with `plain_data`, then returns the verification token.
+    ///
+    /// The official SDKs check this before every block upload: C# decrypts a prefix
+    /// and compares it with the plaintext's (`BlockVerifierBase.VerifyBlock`), JS
+    /// decrypts the whole block "to try to detect bitflips / bad hardware"
+    /// (`cryptoService.verifyBlock`). This does both. Decrypting the whole block
+    /// checks the packet's integrity tag (MDC or AEAD) over all of it, which a prefix
+    /// of a SEIPDv1 packet cannot; the comparison catches a block encrypted from
+    /// other data. A failure is an [`IntegrityException`], and the caller encrypts
+    /// the block again.
     pub fn verify_block(
         &self,
-        data_packet_prefix: &[u8],
-        _plain_data_prefix: &[u8],
+        encrypted_data: &[u8],
+        plain_data: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        Ok(self.create_verification_token(data_packet_prefix))
-    }
-
-    fn create_verification_token(&self, data_packet_prefix: &[u8]) -> Vec<u8> {
-        let length = self.verification_code.len();
-        let mut data_packet_prefix_for_token = vec![0u8; length];
-        let copy_len = std::cmp::min(data_packet_prefix.len(), length);
-        data_packet_prefix_for_token[..copy_len].copy_from_slice(&data_packet_prefix[..copy_len]);
-
-        let mut token_data = vec![0u8; length];
-        for i in 0..length {
-            token_data[i] = self.verification_code[i] ^ data_packet_prefix_for_token[i];
+        let decrypted = self.session_key.decrypt(encrypted_data).map_err(|error| {
+            IntegrityException::new(format!(
+                "Block does not decrypt with the verification session key: {error}"
+            ))
+        })?;
+        if decrypted != plain_data {
+            return Err(
+                IntegrityException::new("Block decrypts to other data than its plaintext").into(),
+            );
         }
-        token_data
+        Ok(create_verification_token(
+            &self.verification_code,
+            encrypted_data,
+        ))
     }
+}
+
+/// The verification code XORed with the encrypted block's first bytes, zero-padded
+/// when the block is shorter than the code.
+fn create_verification_token(verification_code: &[u8], data_packet_prefix: &[u8]) -> Vec<u8> {
+    verification_code
+        .iter()
+        .enumerate()
+        .map(|(i, code)| code ^ data_packet_prefix.get(i).copied().unwrap_or(0))
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -106,37 +135,123 @@ impl BlockVerifierFactory for DefaultBlockVerifierFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::IntegrityException;
+    use proton_rpgp::pgp::ser::Serialize;
 
-    fn verifier(code: &[u8]) -> BlockVerifier {
-        BlockVerifier::new(
-            PgpSessionKey {
-                algorithm: 9,
-                key: vec![0; 32],
-            },
-            code.to_vec(),
-        )
+    fn encrypt(session_key: &PgpSessionKey, plain: &[u8]) -> Vec<u8> {
+        proton_rpgp::Encryptor::default()
+            .with_session_key(session_key.to_rpgp_sk().unwrap())
+            .encrypt(plain)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+    }
+
+    fn verifier_with(session_key: &PgpSessionKey, code: &[u8]) -> BlockVerifier {
+        BlockVerifier::new(session_key.clone(), code.to_vec())
+    }
+
+    fn is_integrity_error(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<IntegrityException>())
     }
 
     #[test]
     fn verification_prefix_length_matches_code_length() {
-        assert_eq!(verifier(&[1; 32]).data_packet_prefix_max_length(), 32);
+        let key = crate::crypto::CryptoGenerator::generate_session_key();
+        assert_eq!(
+            verifier_with(&key, &[1; 32]).data_packet_prefix_max_length(),
+            32
+        );
     }
 
     #[test]
-    fn verification_token_xors_code_and_packet_prefix() {
-        assert_eq!(
-            verifier(&[1, 2, 3]).verify_block(&[3, 2, 1], &[]).unwrap(),
-            vec![2, 0, 2]
+    fn a_block_that_decrypts_to_its_plaintext_gets_the_token() {
+        let key = crate::crypto::CryptoGenerator::generate_session_key();
+        let plain = b"block content".repeat(1000);
+        let encrypted = encrypt(&key, &plain);
+        let code: Vec<u8> = (0..32).collect();
+        let token = verifier_with(&key, &code)
+            .verify_block(&encrypted, &plain)
+            .unwrap();
+        let expected: Vec<u8> = code.iter().zip(&encrypted).map(|(c, d)| c ^ d).collect();
+        assert_eq!(token, expected);
+    }
+
+    #[test]
+    fn an_empty_block_verifies() {
+        let key = crate::crypto::CryptoGenerator::generate_session_key();
+        let encrypted = encrypt(&key, b"");
+        assert!(
+            verifier_with(&key, &[7; 32])
+                .verify_block(&encrypted, b"")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_flipped_bit_anywhere_in_the_block_fails_verification() {
+        let key = crate::crypto::CryptoGenerator::generate_session_key();
+        let plain = vec![0x5a; 300_000];
+        let encrypted = encrypt(&key, &plain);
+        for position in [encrypted.len() / 2, encrypted.len() - 30] {
+            let mut tampered = encrypted.clone();
+            tampered[position] ^= 0x01;
+            let error = verifier_with(&key, &[1; 32])
+                .verify_block(&tampered, &plain)
+                .unwrap_err();
+            assert!(is_integrity_error(&error), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn a_block_encrypted_with_another_session_key_fails_verification() {
+        let key = crate::crypto::CryptoGenerator::generate_session_key();
+        let other = crate::crypto::CryptoGenerator::generate_session_key();
+        let plain = b"content".to_vec();
+        let encrypted = encrypt(&other, &plain);
+        let error = verifier_with(&key, &[1; 32])
+            .verify_block(&encrypted, &plain)
+            .unwrap_err();
+        assert!(is_integrity_error(&error), "{error:#}");
+    }
+
+    #[test]
+    fn a_block_of_other_plaintext_fails_verification() {
+        let key = crate::crypto::CryptoGenerator::generate_session_key();
+        let encrypted = encrypt(&key, b"content A");
+        for plain in [&b"content B"[..], b"content A ", b"content", b""] {
+            let error = verifier_with(&key, &[1; 32])
+                .verify_block(&encrypted, plain)
+                .unwrap_err();
+            assert!(is_integrity_error(&error), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn a_seipdv2_session_key_verifies_its_block() {
+        let key = PgpSessionKey {
+            algorithm: 0,
+            key: crate::crypto::CryptoGenerator::generate_session_key().key,
+        };
+        let plain = vec![3u8; 200_000];
+        let encrypted = encrypt(&key, &plain);
+        assert!(
+            verifier_with(&key, &[1; 32])
+                .verify_block(&encrypted, &plain)
+                .is_ok()
         );
     }
 
     #[test]
     fn verification_token_pads_short_and_truncates_long_prefixes() {
-        let verifier = verifier(&[1, 1, 1]);
-        assert_eq!(verifier.verify_block(&[1], &[]).unwrap(), vec![0, 1, 1]);
+        assert_eq!(create_verification_token(&[1, 1, 1], &[1]), vec![0, 1, 1]);
         assert_eq!(
-            verifier.verify_block(&[1, 1, 1, 1], &[]).unwrap(),
+            create_verification_token(&[1, 1, 1], &[1, 1, 1, 1]),
             vec![0, 0, 0]
+        );
+        assert_eq!(
+            create_verification_token(&[1, 2, 3], &[3, 2, 1]),
+            vec![2, 0, 2]
         );
     }
 }
