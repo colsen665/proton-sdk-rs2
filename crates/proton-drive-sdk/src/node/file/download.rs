@@ -24,6 +24,14 @@ impl FileDownloader {
         })
     }
 
+    /// Downloads the whole revision to `content_output_stream`.
+    ///
+    /// Every block's hash is checked, and the manifest signature is verified once
+    /// all blocks are written. If only the manifest check fails, the content has
+    /// been written, the task returns
+    /// [`crate::node::download::CompletedDownloadManifestVerificationException`],
+    /// and [`DownloadController::get_is_download_complete_with_verification_issue`]
+    /// returns `true`.
     pub fn download_to_stream(
         &self,
         mut content_output_stream: Box<dyn std::io::Write + Send>,
@@ -33,6 +41,8 @@ impl FileDownloader {
         let revision_uid = self.revision_uid.clone();
 
         let (state_tx, state_rx) = tokio::sync::watch::channel(ControllerState::Running);
+        let verification_issue = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_verification_issue = verification_issue.clone();
 
         let completion = tokio::spawn(async move {
             let _file_permit = client.block_downloader().queue.start_file().await?;
@@ -83,6 +93,11 @@ impl FileDownloader {
                 .await;
 
             if let Err(e) = &result {
+                if e.downcast_ref::<crate::node::download::CompletedDownloadManifestVerificationException>()
+                    .is_some()
+                {
+                    task_verification_issue.store(true, Ordering::Relaxed);
+                }
                 if e.downcast_ref::<crate::node::download::FileContentsDecryptionException>()
                     .is_some()
                 {
@@ -111,7 +126,12 @@ impl FileDownloader {
             Ok(())
         });
 
-        DownloadController::new(state_tx, completion, self.client.sdk_events().clone())
+        DownloadController::with_verification_issue_flag(
+            state_tx,
+            completion,
+            self.client.sdk_events().clone(),
+            verification_issue,
+        )
     }
 
     /// Claimed plaintext sizes of each block, required for seeking. Fails on older files that omit them.
@@ -170,6 +190,10 @@ impl FileDownloader {
     }
 
     /// Downloads `[offset, offset+length)` of plaintext using claimed block sizes.
+    ///
+    /// Each downloaded block's hash is checked, but a ranged read cannot verify the
+    /// revision manifest signature, which covers all blocks. Use
+    /// [`Self::download_to_stream`] for an authenticated full download.
     pub async fn download_range(
         &self,
         offset: u64,
