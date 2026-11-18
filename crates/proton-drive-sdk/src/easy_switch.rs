@@ -50,7 +50,8 @@ pub async fn prepare_import_folder_crypto_material(
 ) -> anyhow::Result<ImportFolderCryptoMaterial> {
     validate_node_name(name)?;
     let (request, _, passphrase) =
-        crate::node::folder::FolderOperations::prepare_creation(client, parent_uid, name).await?;
+        crate::node::folder::FolderOperations::prepare_creation(client, parent_uid, name, None)
+            .await?;
     Ok(ImportFolderCryptoMaterial {
         encrypted_name: request.base.name,
         hash: hex::encode(&request.base.name_hash_digest),

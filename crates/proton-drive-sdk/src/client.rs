@@ -1613,6 +1613,7 @@ mod hierarchy_tests {
                 parent_uid: parent.map(|parent| NodeUid::from_parts("volume", parent)),
                 ..NodeBase::default()
             },
+            claimed_modification_time: None,
         });
         client
             .cache()
