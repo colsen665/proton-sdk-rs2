@@ -404,10 +404,8 @@ impl FilesApiClient for DefaultFilesApiClient {
             );
         }
 
-        tracing::debug!("Thumbnail blocks API response: {}", body_text);
-
         let parsed: ThumbnailBlockListResponse = serde_json::from_str(&body_text)
-            .with_context(|| format!("Failed to parse thumbnail blocks response: {}", body_text))?;
+            .context("Failed to parse thumbnail blocks response")?;
 
         tracing::debug!("Parsed {} thumbnail blocks", parsed.blocks.len());
 
