@@ -181,21 +181,29 @@ pub(crate) struct ClaimedRevisionAttributes {
     pub sha1: Option<Vec<u8>>,
     pub block_sizes: Option<Vec<i32>>,
     pub additional_metadata: Option<Vec<AdditionalMetadataProperty>>,
+    /// `Common` fields present but invalid, left out (one bad field drops only itself).
+    pub invalid_fields: Vec<&'static str>,
 }
 
 impl ClaimedRevisionAttributes {
-    /// Maps parsed extended attributes to claimed revision values. Top-level keys other
-    /// than `Common` and `Media` (the flattened `additional_metadata` map) become
-    /// additional metadata, sorted by key; string values are kept verbatim and other
-    /// values as JSON text. `Media` stays out because the uploader writes it from its
-    /// own typed field, so feeding it back as additional metadata would duplicate it.
-    pub(crate) fn from_extended_attributes(xattr: crate::api::attr::ExtendedAttributes) -> Self {
-        let crate::api::attr::ExtendedAttributes {
-            common,
-            additional_metadata,
-            ..
-        } = xattr;
-        let mut additional: Vec<AdditionalMetadataProperty> = additional_metadata
+    /// Parses decrypted XAttr JSON one field at a time, as the official SDKs do (JS
+    /// `extendedAttributes.ts`, C#'s per-field `ModificationTime` result): a `Common`
+    /// field of the wrong type or value is left out and named in `invalid_fields`, and
+    /// the others are kept. Only text that is not a JSON object fails. Top-level keys
+    /// other than `Common` and `Media` become additional metadata, sorted by key; string
+    /// values are kept verbatim and other values as JSON text. `Media` stays out because
+    /// the uploader writes it from its own typed field, so feeding it back as additional
+    /// metadata would duplicate it.
+    pub(crate) fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .context("failed to parse revision extended attributes")?;
+        let serde_json::Value::Object(mut map) = value else {
+            anyhow::bail!("revision extended attributes are not a JSON object");
+        };
+        let common = map.remove("Common");
+        // Written by the uploader from its own typed field; not additional metadata.
+        map.remove("Media");
+        let mut additional: Vec<AdditionalMetadataProperty> = map
             .into_iter()
             .map(|(key, value)| AdditionalMetadataProperty {
                 key,
@@ -207,23 +215,79 @@ impl ClaimedRevisionAttributes {
             .collect();
         additional.sort_by(|a, b| a.key.cmp(&b.key));
 
-        let (size, modification_time, block_sizes, sha1) = match common {
-            Some(c) => (
-                c.size,
-                c.modification_time,
-                c.block_sizes.filter(|s| !s.is_empty()),
-                c.digests.and_then(|d| d.sha1),
-            ),
-            None => (None, None, None, None),
+        let mut invalid_fields = Vec::new();
+        let common = match common {
+            Some(serde_json::Value::Object(common)) => common,
+            None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+            Some(_) => {
+                invalid_fields.push("Common");
+                serde_json::Map::new()
+            }
         };
+        // Absent or null is `Some(None)`, invalid is `None` and named.
+        fn field<T>(
+            invalid: &mut Vec<&'static str>,
+            name: &'static str,
+            parsed: Option<Option<T>>,
+        ) -> Option<T> {
+            parsed.unwrap_or_else(|| {
+                invalid.push(name);
+                None
+            })
+        }
+        let present = |name: &str| common.get(name).filter(|value| !value.is_null());
+        let size = field(
+            &mut invalid_fields,
+            "Size",
+            present("Size").map_or(Some(None), |value| {
+                value.as_i64().filter(|size| *size >= 0).map(Some)
+            }),
+        );
+        let modification_time = field(
+            &mut invalid_fields,
+            "ModificationTime",
+            present("ModificationTime").map_or(Some(None), |value| {
+                value.as_str().and_then(parse_claimed_time).map(Some)
+            }),
+        );
+        let block_sizes = field(
+            &mut invalid_fields,
+            "BlockSizes",
+            present("BlockSizes").map_or(Some(None), |value| {
+                value
+                    .as_array()?
+                    .iter()
+                    .map(|size| {
+                        size.as_i64()
+                            .filter(|size| *size > 0)
+                            .and_then(|size| i32::try_from(size).ok())
+                    })
+                    .collect::<Option<Vec<i32>>>()
+                    .map(|sizes| (!sizes.is_empty()).then_some(sizes))
+            }),
+        );
+        let sha1 = field(
+            &mut invalid_fields,
+            "Digests.SHA1",
+            match present("Digests") {
+                None => Some(None),
+                Some(digests) => digests.as_object().and_then(|digests| {
+                    match digests.get("SHA1").filter(|value| !value.is_null()) {
+                        None => Some(None),
+                        Some(sha1) => sha1.as_str().and_then(decode_digest).map(Some),
+                    }
+                }),
+            },
+        );
 
-        Self {
+        Ok(Self {
             size,
             modification_time,
             sha1,
             block_sizes,
             additional_metadata: (!additional.is_empty()).then_some(additional),
-        }
+            invalid_fields,
+        })
     }
 
     /// Decrypts a revision XAttr with the node key, verifies its signature against the
@@ -247,9 +311,7 @@ impl ClaimedRevisionAttributes {
                 "revision extended attributes signature verification failed"
             );
         }
-        let xattr: crate::api::attr::ExtendedAttributes = serde_json::from_slice(&bytes)
-            .context("failed to parse revision extended attributes")?;
-        Ok(Self::from_extended_attributes(xattr))
+        Self::parse(&bytes)
     }
 
     /// Like [`Self::decrypt`], but returns `None` when the XAttr is absent, and logs a
@@ -262,7 +324,16 @@ impl ClaimedRevisionAttributes {
     ) -> Option<Self> {
         let message = message?;
         match Self::decrypt(message, node_key, authorship_claim) {
-            Ok(attributes) => Some(attributes),
+            Ok(attributes) => {
+                if !attributes.invalid_fields.is_empty() {
+                    tracing::warn!(
+                        revision = %revision_uid,
+                        fields = ?attributes.invalid_fields,
+                        "ignoring invalid fields of revision extended attributes"
+                    );
+                }
+                Some(attributes)
+            }
             Err(error) => {
                 tracing::warn!(
                     revision = %revision_uid,
@@ -275,10 +346,57 @@ impl ClaimedRevisionAttributes {
     }
 }
 
+/// A claimed modification time: RFC 3339, else the ISO 8601 forms other clients write
+/// (no offset, taken as UTC; a space for the `T`; a date alone, at midnight UTC), as
+/// C#'s `Iso8601DateTimeOffsetResultJsonConverter` falls back to a lenient parser.
+fn parse_claimed_time(text: &str) -> Option<DateTime<Utc>> {
+    let text = text.trim();
+    if let Ok(time) = DateTime::parse_from_rfc3339(text) {
+        return Some(time.with_timezone(&Utc));
+    }
+    if let Ok(time) = DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%:z") {
+        return Some(time.with_timezone(&Utc));
+    }
+    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(time) = chrono::NaiveDateTime::parse_from_str(text, format) {
+            return Some(time.and_utc());
+        }
+    }
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|time| time.and_utc())
+}
+
+/// A claimed digest in hex, or base64 as some clients write it.
+fn decode_digest(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    hex::decode(text)
+        .ok()
+        .or_else(|| base64::engine::general_purpose::STANDARD.decode(text).ok())
+}
+
+/// Before 2025 a Windows client wrote block sizes unsorted; all were equal but the
+/// last, which was smaller, so the JS SDK sorts those of earlier revisions in
+/// descending order (`extendedAttributes.ts`, `parseBlockSizes`).
+fn sort_legacy_block_sizes(
+    block_sizes: Option<Vec<i32>>,
+    creation_time: DateTime<Utc>,
+) -> Option<Vec<i32>> {
+    const SORTED_SINCE: i64 = 1_735_689_600; // 2025-01-01T00:00:00Z
+    block_sizes.map(|mut sizes| {
+        if creation_time.timestamp() < SORTED_SINCE {
+            sizes.sort_unstable_by(|a, b| b.cmp(a));
+        }
+        sizes
+    })
+}
+
 impl Revision {
     /// Builds the active revision of a decoded file node. Claimed values come from the
-    /// revision XAttr; when it is absent or unreadable, the size falls back to the
-    /// encrypted size and the modification time to the revision creation time.
+    /// revision XAttr, each field on its own; the modification time falls back to the
+    /// revision creation time. Without a claimed size the size is unknown (`None`): the
+    /// encrypted storage size is never taken for it.
     pub(crate) fn from_active_revision_dto(
         node_uid: &NodeUid,
         dto: Option<&crate::api::revision::ActiveRevisionDto>,
@@ -318,13 +436,13 @@ impl Revision {
             uid,
             creation_time,
             size_on_cloud_storage,
-            claimed_size: Some(claimed.size.unwrap_or(size_on_cloud_storage)),
+            claimed_size: claimed.size,
             claimed_digests: FileContentDigests { sha1: claimed.sha1 },
             claimed_modification_time: Some(claimed.modification_time.unwrap_or(creation_time)),
             thumbnails,
             additional_claimed_metadata: claimed.additional_metadata,
             content_author: Some(authorship_claim.to_potential_author()),
-            claimed_block_sizes: claimed.block_sizes,
+            claimed_block_sizes: sort_legacy_block_sizes(claimed.block_sizes, creation_time),
         }
     }
 }
@@ -1137,6 +1255,8 @@ mod tests {
         assert_eq!(metadata[0].value, "33188");
     }
 
+    /// R2: the encrypted storage size is never taken as the file size; without a
+    /// claimed size the size is unknown.
     #[test]
     fn active_revision_without_xattr_keeps_fallback_values() {
         let node_key = CryptoGenerator::generate_private_key().unwrap();
@@ -1148,7 +1268,8 @@ mod tests {
             &claim_for(&node_key),
         );
 
-        assert_eq!(revision.claimed_size, Some(5_100_000));
+        assert_eq!(revision.claimed_size, None);
+        assert_eq!(revision.size_on_cloud_storage, 5_100_000);
         assert_eq!(revision.claimed_modification_time, Some(dto.creation_time));
         assert_eq!(revision.claimed_digests.sha1, None);
         assert_eq!(revision.claimed_block_sizes, None);
@@ -1171,10 +1292,129 @@ mod tests {
                 &node_key,
                 &claim_for(&node_key),
             );
-            assert_eq!(revision.claimed_size, Some(5_100_000));
+            assert_eq!(revision.claimed_size, None);
             assert_eq!(revision.claimed_modification_time, Some(dto.creation_time));
             assert_eq!(revision.claimed_block_sizes, None);
         }
+    }
+
+    /// Encrypts and signs raw XAttr JSON as an uploader would.
+    fn encrypt_json(
+        value: &serde_json::Value,
+        node_key: &PgpPrivateKey,
+        signing_key: &PgpPrivateKey,
+    ) -> PgpArmoredMessage {
+        let result = Encryptor::default()
+            .with_encryption_key(node_key.0.as_public_key())
+            .with_signing_key(&signing_key.0)
+            .encrypt(&serde_json::to_vec(value).unwrap())
+            .unwrap();
+        PgpArmoredMessage(String::from_utf8(result.armor().unwrap()).unwrap())
+    }
+
+    fn revision_from_json(value: serde_json::Value, create_time: i64) -> Revision {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let message = encrypt_json(&value, &node_key, &node_key);
+        let mut dto = active_revision_dto(Some(&message));
+        dto.creation_time = Utc.timestamp_opt(create_time, 0).unwrap();
+        Revision::from_active_revision_dto(
+            &NodeUid::from_parts("volume", "node"),
+            Some(&dto),
+            &node_key,
+            &claim_for(&node_key),
+        )
+    }
+
+    /// R2: one field that does not decode drops only that field, as the official SDKs
+    /// decode each on its own; the size, block sizes, digest and metadata stay.
+    #[test]
+    fn one_invalid_field_drops_only_that_field() {
+        let revision = revision_from_json(
+            serde_json::json!({
+                "Common": {
+                    "Size": 5_000_123,
+                    "ModificationTime": "last Tuesday",
+                    "BlockSizes": [4_194_304, 805_819],
+                    "Digests": {"SHA1": "deadbeef"}
+                },
+                "pdmount.mode": "33188"
+            }),
+            1_700_000_000,
+        );
+        assert_eq!(revision.claimed_size, Some(5_000_123));
+        assert_eq!(
+            revision.claimed_modification_time,
+            Some(Utc.timestamp_opt(1_700_000_000, 0).unwrap()),
+            "the revision's creation time stands in"
+        );
+        assert_eq!(revision.claimed_block_sizes, Some(vec![4_194_304, 805_819]));
+        assert_eq!(
+            revision.claimed_digests.sha1,
+            Some(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        assert_eq!(revision.additional_claimed_metadata.unwrap().len(), 1);
+
+        let revision = revision_from_json(
+            serde_json::json!({
+                "Common": {
+                    "Size": "5000123",
+                    "ModificationTime": "2024-03-01T10:00:00Z",
+                    "BlockSizes": [4_194_304, -1],
+                    "Digests": {"SHA1": 42}
+                }
+            }),
+            1_700_000_000,
+        );
+        assert_eq!(revision.claimed_size, None);
+        assert_eq!(
+            revision.claimed_modification_time,
+            Some(Utc.timestamp_opt(1_709_287_200, 0).unwrap())
+        );
+        assert_eq!(revision.claimed_block_sizes, None);
+        assert_eq!(revision.claimed_digests.sha1, None);
+    }
+
+    /// Times other clients may write: without an offset (taken as UTC), with a space,
+    /// with an offset, or a date alone (C# falls back to a lenient parser).
+    #[test]
+    fn modification_times_are_parsed_leniently() {
+        for (text, expected) in [
+            ("2024-03-01T10:00:00.250Z", 1_709_287_200),
+            ("2024-03-01T10:00:00", 1_709_287_200),
+            ("2024-03-01 10:00:00", 1_709_287_200),
+            ("2024-03-01T12:00:00+02:00", 1_709_287_200),
+            ("2024-03-01", 1_709_251_200),
+        ] {
+            let revision = revision_from_json(
+                serde_json::json!({"Common": {"ModificationTime": text}}),
+                1_700_000_000,
+            );
+            assert_eq!(
+                revision.claimed_modification_time.map(|t| t.timestamp()),
+                Some(expected),
+                "{text}"
+            );
+        }
+    }
+
+    /// R3: a Windows client wrote block sizes unsorted before 2025; they are sorted in
+    /// descending order for revisions created before 2025-01-01, as the JS SDK does.
+    #[test]
+    fn block_sizes_of_revisions_before_2025_are_sorted() {
+        let xattr = serde_json::json!({
+            "Common": {"Size": 8_389_000, "BlockSizes": [392, 4_194_304, 4_194_304]}
+        });
+        // 2024-12-31T23:59:59Z, then 2025-01-01T00:00:00Z.
+        let old = revision_from_json(xattr.clone(), 1_735_689_599);
+        assert_eq!(
+            old.claimed_block_sizes,
+            Some(vec![4_194_304, 4_194_304, 392])
+        );
+        let new = revision_from_json(xattr, 1_735_689_600);
+        assert_eq!(
+            new.claimed_block_sizes,
+            Some(vec![392, 4_194_304, 4_194_304])
+        );
     }
 
     #[test]
@@ -1195,15 +1435,14 @@ mod tests {
 
     #[test]
     fn non_string_additional_metadata_is_kept_as_json_text() {
-        let xattr: crate::api::attr::ExtendedAttributes =
-            serde_json::from_value(serde_json::json!({
-                "Common": {"Size": 1, "BlockSizes": []},
-                "Media": {"Width": 10},
-                "Location": {"Latitude": 1.5},
-                "pdmount.uid": "1000"
-            }))
-            .unwrap();
-        let claimed = ClaimedRevisionAttributes::from_extended_attributes(xattr);
+        let xattr = serde_json::json!({
+            "Common": {"Size": 1, "BlockSizes": []},
+            "Media": {"Width": 10},
+            "Location": {"Latitude": 1.5},
+            "pdmount.uid": "1000"
+        });
+        let claimed =
+            ClaimedRevisionAttributes::parse(&serde_json::to_vec(&xattr).unwrap()).unwrap();
         assert_eq!(claimed.size, Some(1));
         assert_eq!(claimed.block_sizes, None);
         let metadata = claimed.additional_metadata.unwrap();
