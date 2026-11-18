@@ -44,7 +44,7 @@ impl RecentlyAccessedRequest {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NodeCreationRequest {
     #[serde(rename = "Name")]
     pub name: PgpArmoredMessage,
