@@ -5,9 +5,13 @@
 //! URL, token and hash, and, when the uploader declared them, the plaintext
 //! block sizes used to map byte offsets to blocks.
 
-use crate::api::block::BlockDto;
+use crate::api::block::{BlockDto, BlockListingRevisionDto};
 use crate::client::ProtonDriveClient;
 use crate::node::NodeUid;
+use crate::node::download::{
+    DataIntegrityException, build_revision_manifest, manifest_verification_keys,
+    verify_manifest_signature,
+};
 use crate::node::revision::{RevisionOperations, RevisionUid};
 use crate::pgp::{PgpArmoredMessage, PgpPrivateKey, PgpSessionKey};
 
@@ -20,7 +24,8 @@ pub struct BlockMapEntry {
     pub bare_url: String,
     /// Storage token for `bare_url`.
     pub token: String,
-    /// SHA-256 of the encrypted block as listed by the API; empty if not listed.
+    /// SHA-256 of the encrypted block as listed by the API; never empty in a map
+    /// from [`ProtonDriveClient::get_block_map`].
     pub hash_digest: Vec<u8>,
     /// Plaintext size claimed by the uploader in the revision's `Common.BlockSizes`.
     pub plain_size: Option<u32>,
@@ -41,10 +46,11 @@ pub struct BlockSlice {
 /// any block on its own.
 ///
 /// Build it with [`ProtonDriveClient::get_block_map`] and download blocks with
-/// [`ProtonDriveClient::download_block`]. Each downloaded block's hash is
-/// checked. The revision manifest signature covers all blocks, so it is not
-/// verified by single-block reads; use `FileDownloader::download_to_stream`
-/// for an authenticated full download. The node key is therefore not kept.
+/// [`ProtonDriveClient::download_block`]. Building the map verifies the
+/// revision manifest signature over the listed block hashes (see
+/// [`verify_block_listing`]), and each downloaded block's hash is checked
+/// against its listed hash, so every block read through the map is
+/// authenticated. The node key is not kept.
 #[derive(Clone)]
 pub struct BlockMap {
     /// The revision the blocks belong to.
@@ -228,6 +234,49 @@ impl BlockMap {
     }
 }
 
+/// Checks a revision's block listing before its blocks are read one at a time.
+///
+/// Every block must have a listed hash, otherwise this fails with
+/// [`DataIntegrityException`]: an empty hash would skip the per-block check.
+/// The manifest built from the listed thumbnail and block hashes, in the order
+/// of `FileDownloader::verify_manifest`, must carry a valid signature by one of
+/// `verification_keys`, otherwise this fails with
+/// [`crate::node::download::CompletedDownloadManifestVerificationException`].
+pub fn verify_block_listing(
+    listing: &BlockListingRevisionDto,
+    verification_keys: &[proton_rpgp::PublicKey],
+) -> anyhow::Result<()> {
+    if let Some(block) = listing
+        .blocks
+        .iter()
+        .find(|block| block.hash_digest.is_empty())
+    {
+        return Err(DataIntegrityException::new(format!(
+            "Part of the file appears to be corrupted: block #{} has no listed hash",
+            block.index
+        ))
+        .into());
+    }
+    let revision = &listing.revision;
+    let manifest = build_revision_manifest(
+        revision
+            .thumbnails
+            .iter()
+            .flatten()
+            .map(|thumbnail| (thumbnail.r#type, thumbnail.hash_digest.as_slice())),
+        listing
+            .blocks
+            .iter()
+            .map(|block| block.hash_digest.as_slice()),
+    );
+    verify_manifest_signature(
+        &manifest,
+        revision.manifest_signature.as_ref(),
+        verification_keys,
+    )?;
+    Ok(())
+}
+
 /// Decrypts a revision's extended attributes and returns `Common.BlockSizes`, or
 /// `None` when the attributes do not declare them.
 pub(crate) async fn decrypt_claimed_block_sizes(
@@ -297,6 +346,9 @@ impl ProtonDriveClient {
     /// content key and, when available, the claimed plaintext block sizes from the
     /// revision's extended attributes.
     ///
+    /// The listing is checked with [`verify_block_listing`] first; a missing
+    /// hash or a manifest signature that does not verify fails the call.
+    ///
     /// Sizes come from the XAttr of the revision response, or from the revision
     /// listing when that response has none. They are left unknown when the
     /// revision does not declare them or its extended attributes cannot be
@@ -307,6 +359,20 @@ impl ProtonDriveClient {
                 .await?;
         let revision =
             RevisionOperations::get_revision_with_all_blocks(self, &revision_uid).await?;
+        let verification_keys = manifest_verification_keys(
+            self,
+            revision.revision.signature_email_address.as_deref(),
+            &secrets.base.key,
+        )
+        .await?;
+        if let Err(error) = verify_block_listing(&revision, &verification_keys) {
+            log::warn!(
+                "Block listing verification failed for revision \"{}\": {:#}",
+                revision_uid,
+                error
+            );
+            return Err(error);
+        }
 
         let sizes = match revision.revision.extended_attributes.as_ref() {
             Some(xattr) => {
@@ -383,7 +449,12 @@ impl ProtonDriveClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::file::thumbnail::ThumbnailDto;
+    use crate::api::revision::RevisionDto;
     use crate::crypto::CryptoGenerator;
+    use crate::node::download::CompletedDownloadManifestVerificationException;
+    use crate::node::thumbnail::ThumbnailType;
+    use crate::pgp::PgpArmoredSignature;
 
     fn block(index: i32) -> BlockDto {
         BlockDto {
@@ -499,6 +570,125 @@ mod tests {
         assert!(map.entry(0).is_none());
         assert!(map.entry(4).is_none());
         assert!(map.entry(-1).is_none());
+    }
+
+    fn listing(
+        blocks: Vec<BlockDto>,
+        signature: Option<PgpArmoredSignature>,
+    ) -> BlockListingRevisionDto {
+        BlockListingRevisionDto {
+            revision: RevisionDto {
+                third_party: None,
+                sdk: None,
+                id: crate::revision::RevisionId::new("revision".into()),
+                client_id: None,
+                creation_time: chrono::DateTime::UNIX_EPOCH,
+                size: 0,
+                manifest_signature: signature,
+                signature_email_address: None,
+                state: crate::node::revision::RevisionState::Active,
+                extended_attributes: None,
+                thumbnails: Some(vec![ThumbnailDto {
+                    id: "thumbnail".into(),
+                    r#type: ThumbnailType::Thumbnail,
+                    hash_digest: vec![0xee; 32],
+                    size_on_cloud_storage: 1,
+                }]),
+            },
+            blocks,
+        }
+    }
+
+    /// A listing of `count` blocks signed by `key` as the uploader signs it.
+    fn signed_listing(key: &PgpPrivateKey, count: i32) -> BlockListingRevisionDto {
+        let blocks: Vec<_> = (1..=count).map(block).collect();
+        let manifest = build_revision_manifest(
+            [(ThumbnailType::Thumbnail, [0xee; 32].as_slice())],
+            blocks.iter().map(|block| block.hash_digest.as_slice()),
+        );
+        let signature = key.sign_detached_armored(&manifest).unwrap();
+        listing(blocks, Some(signature))
+    }
+
+    fn public_key(key: &PgpPrivateKey) -> proton_rpgp::PublicKey {
+        use proton_rpgp::AsPublicKeyRef;
+        key.0.as_public_key().clone()
+    }
+
+    fn is_manifest_error(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<CompletedDownloadManifestVerificationException>()
+            .is_some()
+    }
+
+    #[test]
+    fn a_signed_listing_verifies() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+
+        verify_block_listing(&signed_listing(&key, 3), &[public_key(&key)]).unwrap();
+    }
+
+    #[test]
+    fn a_tampered_block_hash_fails_verification() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        let mut listing = signed_listing(&key, 3);
+        listing.blocks[1].hash_digest = vec![0x42; 32];
+
+        let error = verify_block_listing(&listing, &[public_key(&key)]).unwrap_err();
+        assert!(is_manifest_error(&error), "{error:#}");
+    }
+
+    #[test]
+    fn a_dropped_thumbnail_or_block_fails_verification() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        let mut without_thumbnail = signed_listing(&key, 2);
+        without_thumbnail.revision.thumbnails = None;
+        let mut without_block = signed_listing(&key, 2);
+        without_block.blocks.pop();
+
+        for listing in [without_thumbnail, without_block] {
+            let error = verify_block_listing(&listing, &[public_key(&key)]).unwrap_err();
+            assert!(is_manifest_error(&error), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn a_signature_by_another_key_fails_verification() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        let other = CryptoGenerator::generate_private_key().unwrap();
+
+        let error =
+            verify_block_listing(&signed_listing(&other, 2), &[public_key(&key)]).unwrap_err();
+        assert!(is_manifest_error(&error), "{error:#}");
+    }
+
+    #[test]
+    fn an_unsigned_listing_fails_verification() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+
+        let error =
+            verify_block_listing(&listing(vec![block(1)], None), &[public_key(&key)]).unwrap_err();
+        assert!(is_manifest_error(&error), "{error:#}");
+    }
+
+    #[test]
+    fn an_empty_block_hash_fails_verification() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        // Signed over the empty hash: the signature alone would pass.
+        let mut blocks: Vec<_> = (1..=2).map(block).collect();
+        blocks[1].hash_digest.clear();
+        let manifest = build_revision_manifest(
+            [(ThumbnailType::Thumbnail, [0xee; 32].as_slice())],
+            blocks.iter().map(|block| block.hash_digest.as_slice()),
+        );
+        let signature = key.sign_detached_armored(&manifest).unwrap();
+
+        let error = verify_block_listing(&listing(blocks, Some(signature)), &[public_key(&key)])
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<DataIntegrityException>().is_some(),
+            "{error:#}"
+        );
     }
 
     #[test]
