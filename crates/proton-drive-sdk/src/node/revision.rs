@@ -230,60 +230,70 @@ impl RevisionOperations {
             "Getting revision blocks for revision_id={}",
             revision_uid.revision_id.raw()
         );
-        // The API lists blocks a page at a time; a full page means more follow.
-        let page_size = crate::node::download::DEFAULT_BLOCK_PAGE_SIZE;
-        let mut revision_response = client
-            .api()
-            .files()
-            .get_revision(
-                revision_uid.node_uid.volume_id.clone(),
-                revision_uid.node_uid.link_id.clone(),
-                revision_uid.revision_id.clone(),
-                Some(crate::node::download::MIN_BLOCK_INDEX),
-                Some(page_size),
-                false,
-            )
+        let revision = Self::get_revision_with_all_blocks(client, &revision_uid)
             .await
             .context("Failed to get revision from API")?;
-        let mut page_len = revision_response.revision.blocks.len();
-        while let Some(from_index) =
-            next_block_page_start(&revision_response.revision.blocks, page_len, page_size)
-        {
-            let page = client
-                .api()
-                .files()
-                .get_revision(
-                    revision_uid.node_uid.volume_id.clone(),
-                    revision_uid.node_uid.link_id.clone(),
-                    revision_uid.revision_id.clone(),
-                    Some(from_index),
-                    Some(page_size),
-                    false,
-                )
-                .await
-                .context("Failed to get revision blocks from API")?
-                .revision
-                .blocks;
-            page_len = page.len();
-            revision_response.revision.blocks.extend(page);
-        }
-        ensure_contiguous_blocks(&revision_response.revision.blocks)?;
 
         tracing::debug!(
             "Download state created for revision {:?}: {} blocks, size={}",
             revision_uid.revision_id,
-            revision_response.revision.blocks.len(),
-            revision_response.revision.revision.size
+            revision.blocks.len(),
+            revision.revision.size
         );
 
+        // One block-listing slot covers the whole listing, however many pages it took.
         release_block_listing_action(1);
 
         Ok(DownloadState::new(
             revision_uid,
-            revision_response.revision,
+            revision,
             secrets.base.key,
             secrets.content_key,
         ))
+    }
+
+    /// Fetches a revision together with its complete block list.
+    ///
+    /// The block list is requested page by page (see
+    /// [`crate::node::download::list_all_blocks`]), so revisions with more than
+    /// [`crate::node::download::DEFAULT_BLOCK_PAGE_SIZE`] blocks are listed in full.
+    /// The revision metadata is taken from the first page.
+    pub async fn get_revision_with_all_blocks(
+        client: &ProtonDriveClient,
+        revision_uid: &RevisionUid,
+    ) -> anyhow::Result<crate::api::block::BlockListingRevisionDto> {
+        let first_revision = std::sync::Mutex::new(None);
+        let blocks = crate::node::download::list_all_blocks(
+            crate::node::download::DEFAULT_BLOCK_PAGE_SIZE,
+            |from_block_index, page_size| {
+                let first_revision = &first_revision;
+                async move {
+                    let response = client
+                        .api()
+                        .files()
+                        .get_revision(
+                            revision_uid.node_uid.volume_id.clone(),
+                            revision_uid.node_uid.link_id.clone(),
+                            revision_uid.revision_id.clone(),
+                            Some(from_block_index),
+                            Some(page_size),
+                            false,
+                        )
+                        .await?;
+                    let crate::api::block::BlockListingRevisionDto { revision, blocks } =
+                        response.revision;
+                    first_revision.lock().unwrap().get_or_insert(revision);
+                    Ok(blocks)
+                }
+            },
+        )
+        .await?;
+
+        let revision = first_revision
+            .into_inner()
+            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("revision listing returned no revision"))?;
+        Ok(crate::api::block::BlockListingRevisionDto { revision, blocks })
     }
 
     pub fn open_for_reading(
@@ -299,31 +309,6 @@ impl RevisionOperations {
     }
 }
 
-/// Where the next block page starts, or `None` once a short page ended the listing.
-fn next_block_page_start(
-    blocks: &[crate::api::block::BlockDto],
-    last_page_len: usize,
-    page_size: i32,
-) -> Option<i32> {
-    if last_page_len == 0 || last_page_len < page_size as usize {
-        return None;
-    }
-    blocks.last().map(|block| block.index + 1)
-}
-
-/// Blocks must run 1, 2, 3, ... so no part of the file is silently skipped.
-fn ensure_contiguous_blocks(blocks: &[crate::api::block::BlockDto]) -> anyhow::Result<()> {
-    for (position, block) in blocks.iter().enumerate() {
-        let expected = crate::node::download::MIN_BLOCK_INDEX + position as i32;
-        anyhow::ensure!(
-            block.index == expected,
-            "revision block listing has block {} where {expected} was expected",
-            block.index
-        );
-    }
-    Ok(())
-}
-
 pub struct RevisionWriter {
     client: Arc<ProtonDriveClient>,
     draft: RevisionDraft,
@@ -334,7 +319,7 @@ pub struct RevisionWriter {
     block_number: i32,
     digests: Vec<u8>,
     block_sizes: Vec<i32>,
-    thumbnail_digests: Vec<u8>,
+    thumbnail_digests: Vec<(crate::node::thumbnail::ThumbnailType, Vec<u8>)>,
     sha1_hasher: sha1::Sha1,
     /// Pre-computed SHA1 hash from pipelined write (set by producer task)
     precomputed_sha1: Option<[u8; 20]>,
@@ -699,7 +684,7 @@ impl RevisionWriter {
                 )
                 .await?;
 
-            self.thumbnail_digests.extend_from_slice(&hash_digest);
+            self.thumbnail_digests.push((thumb_type, hash_digest));
         }
 
         Ok(())
@@ -717,9 +702,14 @@ impl RevisionWriter {
             block_sizes = ?self.block_sizes,
             "Committing revision"
         );
-        let mut manifest = Vec::with_capacity(self.thumbnail_digests.len() + self.digests.len());
-        manifest.extend_from_slice(&self.thumbnail_digests);
-        manifest.extend_from_slice(&self.digests);
+        // Thumbnail digests ordered by type, then block digests in index order, as
+        // the downloader rebuilds it in RevisionReader::verify_manifest.
+        let manifest = crate::node::download::build_revision_manifest(
+            self.thumbnail_digests
+                .iter()
+                .map(|(thumbnail_type, digest)| (*thumbnail_type, digest.as_slice())),
+            std::iter::once(self.digests.as_slice()),
+        );
         let manifest_signature = self.draft.signing_key.sign_detached_armored(&manifest)?;
 
         // Use precomputed SHA1 from pipelined write, or fall back to hasher
@@ -829,7 +819,7 @@ impl RevisionWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{UploadProgress, ensure_contiguous_blocks, next_block_page_start};
+    use super::UploadProgress;
     use std::sync::Arc;
 
     #[test]
@@ -854,30 +844,5 @@ mod tests {
             *reports.lock().unwrap(),
             [(75, 300), (105, 300), (180, 300), (300, 300), (300, 300)]
         );
-    }
-    use crate::api::block::BlockDto;
-
-    fn blocks(indexes: std::ops::RangeInclusive<i32>) -> Vec<BlockDto> {
-        indexes
-            .map(|index| serde_json::from_value(serde_json::json!({ "Index": index })).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn block_listing_keeps_paging_past_the_first_full_page() {
-        // A 48 MB file has 12 blocks: one full page of 10, then a page of 2.
-        let first = blocks(1..=10);
-        assert_eq!(next_block_page_start(&first, 10, 10), Some(11));
-        let all = blocks(1..=12);
-        assert_eq!(next_block_page_start(&all, 2, 10), None);
-        assert_eq!(next_block_page_start(&[], 0, 10), None);
-    }
-
-    #[test]
-    fn block_listing_with_gaps_is_rejected() {
-        assert!(ensure_contiguous_blocks(&blocks(1..=12)).is_ok());
-        let mut gap = blocks(1..=10);
-        gap.extend(blocks(12..=12));
-        assert!(ensure_contiguous_blocks(&gap).is_err());
     }
 }
