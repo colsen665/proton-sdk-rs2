@@ -791,6 +791,10 @@ pub struct ShareMembershipSummaryDto {
     #[serde(rename = "MembershipID")]
     pub membership_id: ShareMembershipId,
 
+    /// The member's own address that accepted the invitation.
+    #[serde(rename = "AddressID", default)]
+    pub address_id: Option<AddressId>,
+
     #[serde(rename = "Permissions")]
     pub permissions: ShareMemberPermissions,
 
@@ -809,6 +813,11 @@ pub struct ShareMembershipSummaryDto {
 
     #[serde(rename = "InviterSharePassphraseKeyPacketSignature")]
     pub inviter_share_passphrase_key_packet_signature: Option<PgpArmoredSignature>,
+
+    /// The member's signature of the share passphrase's session key, made when
+    /// accepting the invitation (signing context `drive.share-member.member`).
+    #[serde(rename = "InviteeSharePassphraseSessionKeySignature", default)]
+    pub invitee_share_passphrase_session_key_signature: Option<PgpArmoredSignature>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1690,6 +1699,41 @@ mod tests {
             membership
                 .permissions
                 .contains(ShareMemberPermissions::WRITE)
+        );
+        assert_eq!(membership.address_id, None);
+        assert!(
+            membership
+                .invitee_share_passphrase_session_key_signature
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn membership_summary_parses_the_acceptance() {
+        let membership: ShareMembershipSummaryDto = serde_json::from_str(
+            r#"{
+                "ShareID": "share",
+                "MembershipID": "membership",
+                "AddressID": "address",
+                "Permissions": 4,
+                "InviteTime": 1727000000,
+                "InviterEmail": "owner@example.com",
+                "MemberSharePassphraseKeyPacket": "0102",
+                "InviterSharePassphraseKeyPacketSignature": "inviter",
+                "InviteeSharePassphraseSessionKeySignature": "invitee"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            membership.address_id,
+            Some(AddressId::new("address".into()))
+        );
+        assert_eq!(
+            membership
+                .invitee_share_passphrase_session_key_signature
+                .map(|signature| signature.0),
+            Some("invitee".to_string())
         );
     }
 

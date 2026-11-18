@@ -22,7 +22,7 @@ use rand::RngExt;
 pub use crate::api::share::{AbuseCategory, MemberRole};
 
 const SIGNING_INVITER: &str = "drive.share-member.inviter";
-const SIGNING_MEMBER: &str = "drive.share-member.member";
+pub(crate) const SIGNING_MEMBER: &str = "drive.share-member.member";
 const SIGNING_EXTERNAL: &str = "drive.share-member.external-invitation";
 const PUBLIC_LINK_PASSWORD_LEN: usize = 12;
 const GENERATED_PASSWORD_CHARSET: &[u8] =

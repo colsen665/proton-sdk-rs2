@@ -119,9 +119,16 @@ struct IntegrityMetric<'a> {
 pub(crate) struct IntegrityReporter {
     decryption_errors: Mutex<HashSet<String>>,
     verification_errors: Mutex<HashSet<String>>,
+    warnings: Mutex<HashSet<(String, &'static str)>>,
 }
 
 impl IntegrityReporter {
+    /// True the first time a warning about `field` of the item `uid` is due,
+    /// so that a node decoded again does not log it again.
+    pub fn first_warning(&self, uid: &str, field: &'static str) -> bool {
+        self.warnings.lock().insert((uid.to_owned(), field))
+    }
+
     pub async fn report(
         &self,
         client: &ProtonDriveClient,
