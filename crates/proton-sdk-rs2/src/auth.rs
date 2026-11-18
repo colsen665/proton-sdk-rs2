@@ -53,6 +53,77 @@ impl std::fmt::Display for RefreshSessionError {
 
 impl std::error::Error for RefreshSessionError {}
 
+/// The request path of a session-fork call, as it appears in error texts.
+///
+/// The selector itself authorises collecting the session's tokens, so it is never part of an
+/// error or a log line.
+pub const SESSION_FORK_PATH: &str = "auth/v4/sessions/forks/<selector>";
+
+/// A failed poll of a session fork (`GET auth/v4/sessions/forks/<selector>`).
+///
+/// Returned (inside `anyhow::Error`) by [`DefaultAuthenticationApiClient`]'s
+/// `poll_session_fork`. Its text, and that of its sources, names the path template
+/// [`SESSION_FORK_PATH`], never the request URL.
+#[derive(Debug)]
+pub struct SessionForkPollError {
+    transient: bool,
+    retry_after: Option<std::time::Duration>,
+    source: anyhow::Error,
+}
+
+impl SessionForkPollError {
+    fn new(
+        transient: bool,
+        retry_after: Option<std::time::Duration>,
+        source: anyhow::Error,
+    ) -> Self {
+        Self {
+            transient,
+            retry_after,
+            source,
+        }
+    }
+
+    /// A transport failure, HTTP 408, 429 or 5xx: a later poll may succeed.
+    pub fn is_transient(&self) -> bool {
+        self.transient
+    }
+
+    /// The delay a `Retry-After` header (in seconds) asked for.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        self.retry_after
+    }
+}
+
+impl std::fmt::Display for SessionForkPollError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "polling the session fork failed")
+    }
+}
+
+impl std::error::Error for SessionForkPollError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn parse_retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(std::time::Duration::from_secs(seconds))
+}
+
 /// Why a token refresh failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenRefreshFailureKind {
@@ -455,11 +526,19 @@ pub trait AuthenticationApiClient: Send + Sync {
         &self,
         selector: &str,
     ) -> anyhow::Result<Option<SessionForkStatusResponse>>;
+
+    /// Invalidates a session-fork selector without forking the session
+    /// (`DELETE auth/v4/sessions/forks/<selector>`), so that a login that ended without a session
+    /// leaves no fork the selector could still collect. The default does nothing.
+    async fn invalidate_session_fork(&self, _selector: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct DefaultAuthenticationApiClient {
     http_client: reqwest::Client,
     refresh_redirect_uri: Uri,
+    api_base: Option<reqwest::Url>,
 }
 
 impl DefaultAuthenticationApiClient {
@@ -469,6 +548,21 @@ impl DefaultAuthenticationApiClient {
         Self {
             http_client,
             refresh_redirect_uri,
+            api_base: None,
+        }
+    }
+
+    /// A client that sends its requests to `api_base` instead of the Proton API (tests).
+    #[cfg(test)]
+    pub(crate) fn with_api_base(
+        http_client: reqwest::Client,
+        refresh_redirect_uri: Uri,
+        api_base: reqwest::Url,
+    ) -> Self {
+        Self {
+            http_client,
+            refresh_redirect_uri,
+            api_base: Some(api_base),
         }
     }
 
@@ -477,8 +571,17 @@ impl DefaultAuthenticationApiClient {
             return Ok(path.to_string());
         }
 
-        let base = reqwest::Url::parse(Self::DEFAULT_API_BASE)?;
+        let base = match &self.api_base {
+            Some(base) => base.clone(),
+            None => reqwest::Url::parse(Self::DEFAULT_API_BASE)?,
+        };
         Ok(base.join(path)?.to_string())
+    }
+
+    /// The URL of a session-fork call; an error about it names [`SESSION_FORK_PATH`] only.
+    fn session_fork_endpoint(&self, selector: &str) -> anyhow::Result<String> {
+        self.endpoint(&format!("auth/v4/sessions/forks/{selector}"))
+            .map_err(|_| anyhow::anyhow!("invalid URL for {SESSION_FORK_PATH}"))
     }
 
     fn auth_headers(session_id: &SessionId, access_token: &str) -> anyhow::Result<HeaderMap> {
@@ -497,20 +600,32 @@ impl DefaultAuthenticationApiClient {
             return Ok(response);
         }
 
-        let url = response.url().clone();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("<failed to read response body: {error}>"));
+        let target = format!("url ({})", response.url());
+        Err(Self::status_error(response, &target).await)
+    }
+
+    /// The error for a non-success `response`, naming `target` as the request; it does not
+    /// look at the response's URL.
+    async fn status_error(response: reqwest::Response, target: &str) -> anyhow::Error {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_else(|error| {
+            format!("<failed to read response body: {}>", error.without_url())
+        });
         let body = truncate_error_body(&body);
 
         if status.is_client_error() {
-            anyhow::bail!("HTTP status client error ({status}) for url ({url}): {body}");
+            anyhow::anyhow!("HTTP status client error ({status}) for {target}: {body}")
         } else if status.is_server_error() {
-            anyhow::bail!("HTTP status server error ({status}) for url ({url}): {body}");
+            anyhow::anyhow!("HTTP status server error ({status}) for {target}: {body}")
         } else {
-            anyhow::bail!("HTTP status error ({status}) for url ({url}): {body}");
+            anyhow::anyhow!("HTTP status error ({status}) for {target}: {body}")
         }
+    }
+
+    /// A transport error of a session-fork call, without the request URL.
+    fn session_fork_transport_error(error: reqwest::Error) -> anyhow::Error {
+        anyhow::Error::new(error.without_url())
+            .context(format!("sending the request for {SESSION_FORK_PATH}"))
     }
 }
 
@@ -737,15 +852,59 @@ impl AuthenticationApiClient for DefaultAuthenticationApiClient {
         &self,
         selector: &str,
     ) -> anyhow::Result<Option<SessionForkStatusResponse>> {
-        let path = format!("auth/v4/sessions/forks/{selector}");
-        let response = self.http_client.get(self.endpoint(&path)?).send().await?;
-        if response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        // The selector is a path segment of the URL: no error built here carries the URL.
+        let url = self.session_fork_endpoint(selector)?;
+        let response = self.http_client.get(url).send().await.map_err(|error| {
+            SessionForkPollError::new(true, None, Self::session_fork_transport_error(error))
+        })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             return Ok(None);
         }
-        let response = Self::error_for_status_with_body(response).await?;
-        Ok(Some(
-            crate::utils::decode_json::<SessionForkStatusResponse>(response).await?,
-        ))
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            let error = Self::status_error(response, SESSION_FORK_PATH).await;
+            return Err(
+                SessionForkPollError::new(is_transient_status(status), retry_after, error).into(),
+            );
+        }
+        // A fork answers once: a failure from here on is not retried.
+        let body = response.bytes().await.map_err(|error| {
+            SessionForkPollError::new(
+                false,
+                None,
+                anyhow::Error::new(error.without_url())
+                    .context(format!("reading the response of {SESSION_FORK_PATH}")),
+            )
+        })?;
+        // serde's message can quote a value of the body, which carries the session's tokens.
+        let status = serde_json::from_slice::<SessionForkStatusResponse>(&body).map_err(|error| {
+            SessionForkPollError::new(
+                false,
+                None,
+                anyhow::anyhow!(
+                    "malformed response of {SESSION_FORK_PATH} ({:?} error at line {}, column {})",
+                    error.classify(),
+                    error.line(),
+                    error.column()
+                ),
+            )
+        })?;
+        Ok(Some(status))
+    }
+
+    async fn invalidate_session_fork(&self, selector: &str) -> anyhow::Result<()> {
+        let url = self.session_fork_endpoint(selector)?;
+        let response = self
+            .http_client
+            .delete(url)
+            .send()
+            .await
+            .map_err(Self::session_fork_transport_error)?;
+        if !response.status().is_success() {
+            return Err(Self::status_error(response, SESSION_FORK_PATH).await);
+        }
+        Ok(())
     }
 }
 
