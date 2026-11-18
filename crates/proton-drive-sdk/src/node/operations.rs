@@ -61,9 +61,16 @@ impl NodeOperations {
         let share_response = client.api().shares().get_my_files_share().await?;
         let (volume_dto, share_dto, link_details) = share_response.deconstruct();
 
+        // As C#: the share is described by this response, no request for it.
+        let share = crate::share::Share {
+            id: share_dto.id.clone(),
+            root_folder_id: NodeUid::new(volume_dto.id.clone(), link_details.link.id.clone()),
+            membership_address_id: share_dto.address_id.clone(),
+            share_type: crate::api::share::ShareType::Main,
+        };
         let (share, share_key) = crate::share_ops::ShareCrypto::decrypt_share_with_creation_time(
             client,
-            share_dto.id.clone(),
+            share,
             &share_dto.key,
             &share_dto.passphrase,
             &share_dto.passphrase_signature,
@@ -71,7 +78,6 @@ impl NodeOperations {
                 .invitee_share_passphrase_session_key_signature
                 .as_ref(),
             &share_dto.creator_email_address,
-            &share_dto.address_id,
             share_dto.creation_time,
         )
         .await?;

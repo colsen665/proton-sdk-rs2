@@ -210,7 +210,7 @@ impl ProtonDriveClient {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn from_http_clients(
+    pub(crate) fn from_http_clients(
         default_api_http_client: reqwest_middleware::ClientWithMiddleware,
         storage_api_http_client: reqwest_middleware::ClientWithMiddleware,
         default_api_base_url: reqwest::Url,
