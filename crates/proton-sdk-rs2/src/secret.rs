@@ -60,11 +60,9 @@ impl SessionSecretCache for DefaultSecretCache {
         if serialized_value.is_none() {
             log::debug!("No serialized value");
         }
-        log::debug!("Serialized value: {:?}", serialized_value);
 
         match serialized_value {
             Some(value) => {
-                log::debug!("Serialized value: {:?}", value);
                 let decoded = general_purpose::STANDARD.decode(value)?;
                 Ok(Some(decoded))
             }
