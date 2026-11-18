@@ -319,6 +319,202 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
+    /// Folder link details encrypted to `parent_key`, as `FolderOperations::create`
+    /// makes them, named like the link.
+    fn folder_link_details(
+        id: &str,
+        parent: &str,
+        parent_key: &PgpPrivateKey,
+    ) -> crate::api::links::LinkDetailsDto {
+        use crate::crypto::CryptoGenerator;
+        use crate::node::crypto::NodeCrypto;
+        let folder_key = CryptoGenerator::generate_private_key().unwrap();
+        let passphrase = CryptoGenerator::generate_passphrase();
+        let locked_key = folder_key
+            .to_armored_private_key(Some(passphrase.as_bytes()))
+            .unwrap();
+        let (encrypted_passphrase, passphrase_signature, _) =
+            NodeCrypto::encrypt_and_sign_passphrase(passphrase.as_bytes(), parent_key, parent_key)
+                .unwrap();
+        let (name, name_hash, _) = NodeCrypto::encrypt_and_sign_name(
+            id,
+            &CryptoGenerator::generate_folder_hash_key(),
+            parent_key,
+            parent_key,
+        )
+        .unwrap();
+        let hash_key = NodeCrypto::encrypt_folder_hash_key(
+            &folder_key,
+            &CryptoGenerator::generate_folder_hash_key(),
+            parent_key,
+        )
+        .unwrap();
+        serde_json::from_value(serde_json::json!({
+            "Link": {
+                "LinkID": id, "ParentLinkID": parent, "Type": 1, "State": 1,
+                "CreateTime": 1_600_000_000, "ModifyTime": 1_600_000_000,
+                "Name": name.0, "NameHash": hex::encode(name_hash),
+                "NodeKey": locked_key.0, "NodePassphrase": encrypted_passphrase.0,
+                "NodePassphraseSignature": passphrase_signature.unwrap().0
+            },
+            "Folder": { "NodeHashKey": hash_key.0 }
+        }))
+        .unwrap()
+    }
+
+    /// File link details whose name, passphrase and key are not readable (they would be
+    /// encrypted to the parent's key, which is not there).
+    fn file_link_details(id: &str, parent: &str) -> crate::api::links::LinkDetailsDto {
+        serde_json::from_value(serde_json::json!({
+            "Link": {
+                "LinkID": id, "ParentLinkID": parent, "Type": 2, "State": 1,
+                "CreateTime": 1_600_000_000, "ModifyTime": 1_600_000_000,
+                "Name": "name", "NameHash": "abcd", "NodeKey": "key",
+                "NodePassphrase": "passphrase", "MIMEType": "text/plain"
+            },
+            "File": {
+                "MediaType": "text/plain", "TotalEncryptedSize": 42, "ContentKeyPacket": ""
+            }
+        }))
+        .unwrap()
+    }
+
+    async fn cache_folder_secrets(
+        client: &ProtonDriveClient,
+        link: &str,
+        secrets: PotentialObject<FolderSecrets, DegradedFolderSecrets>,
+    ) {
+        client
+            .cache()
+            .secrets()
+            .set_folder_secrets(NodeUid::from_parts("volume", link), secrets)
+            .await
+            .unwrap();
+    }
+
+    fn degraded_folder_secrets() -> DegradedFolderSecrets {
+        DegradedFolderSecrets {
+            base: DegradedNodeSecrets {
+                key: None,
+                passphrase_session_key: None,
+                name_session_key: None,
+            },
+            hash_key: None,
+        }
+    }
+
+    /// M6.0.3 V-3: a link whose parent folder's secrets are degraded used to fail the
+    /// whole batch, and with it every event page that named the link.
+    #[tokio::test]
+    async fn a_link_under_a_degraded_parent_is_degraded_and_the_batch_goes_on() {
+        let (client, _) = crate::test_support::client().await;
+        let good_key = crate::crypto::CryptoGenerator::generate_private_key().unwrap();
+        cache_folder_secrets(
+            &client,
+            "good",
+            PotentialObject::Node(FolderSecrets {
+                base: NodeSecrets {
+                    key: good_key.clone(),
+                    passphrase_session_key: crate::crypto::CryptoGenerator::generate_session_key(),
+                    passphrase_pgp_session_key: None,
+                    name_session_key: crate::crypto::CryptoGenerator::generate_session_key(),
+                    passphrase_for_anonymous_move: None,
+                },
+                hash_key: vec![],
+            }),
+        )
+        .await;
+        cache_folder_secrets(
+            &client,
+            "bad",
+            PotentialObject::Degraded(degraded_folder_secrets()),
+        )
+        .await;
+
+        let results = DtoToMetadataConverter::decode_fresh_links(
+            &client,
+            VolumeId::new("volume".into()),
+            vec![
+                folder_link_details("before", "good", &good_key),
+                file_link_details("orphan", "bad"),
+                folder_link_details("after", "good", &good_key),
+            ],
+        )
+        .await
+        .expect("one undecryptable parent must not fail the batch");
+
+        let names: Vec<_> = results
+            .iter()
+            .map(|result| match result {
+                PotentialObject::Node(m) => m.node().base().name.clone(),
+                PotentialObject::Degraded(m) => {
+                    format!("degraded {}", m.node().uid().link_id.raw())
+                }
+            })
+            .collect();
+        assert_eq!(names, ["before", "degraded orphan", "after"]);
+
+        let PotentialObject::Degraded(orphan) = &results[1] else {
+            unreachable!()
+        };
+        assert_eq!(orphan.name_hash_digest, [0xab, 0xcd]);
+        let DegradedNodeAndSecrets::File(file, secrets) = &orphan.inner else {
+            panic!("expected a degraded file, got {:?}", orphan.inner);
+        };
+        assert_eq!(
+            file.base.parent_uid,
+            Some(NodeUid::from_parts("volume", "bad"))
+        );
+        assert_eq!(file.total_storage_quota_usage, 42);
+        assert_eq!(file.media_type, "text/plain");
+        assert!(secrets.base.key.is_none());
+        assert_eq!(
+            file.base
+                .errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["Cryptography error: Parent folder key is degraded"]
+        );
+
+        // The decoded nodes are cached; the degraded one is not (its parent may
+        // decrypt later).
+        let entities = client.cache().entities();
+        for (link, cached) in [("before", true), ("orphan", false), ("after", true)] {
+            let entry = entities
+                .try_get_node(NodeUid::from_parts("volume", link))
+                .await
+                .unwrap();
+            assert_eq!(entry.is_some(), cached, "{link}");
+        }
+    }
+
+    /// The error of a degraded folder's secrets is told apart by type, not by its text.
+    #[tokio::test]
+    async fn degraded_folder_secrets_are_an_undecryptable_node_error() {
+        let (client, _) = crate::test_support::client().await;
+        cache_folder_secrets(
+            &client,
+            "bad",
+            PotentialObject::Degraded(degraded_folder_secrets()),
+        )
+        .await;
+        let error = crate::node::folder::FolderOperations::get_secrets(
+            &client,
+            NodeUid::from_parts("volume", "bad"),
+        )
+        .await
+        .unwrap_err();
+        assert!(crate::error::UndecryptableNodeError::is_cause_of(&error));
+        assert!(crate::error::UndecryptableNodeError::is_cause_of(
+            &error.context("resolving the parent")
+        ));
+        // A failed request or any other error with the same words is not one.
+        assert!(!crate::error::UndecryptableNodeError::is_cause_of(
+            &anyhow::anyhow!("Degraded node has no folder secrets")
+        ));
+    }
+
     #[test]
     fn from_parts_round_trips() {
         let uid = NodeUid::from_parts("vol", "link");
@@ -623,9 +819,9 @@ impl NodeMetadataResult {
                 }
                 crate::node::NodeAndSecrets::Folder(_, s) => Ok(s),
             },
-            PotentialObject::Degraded(_) => {
-                anyhow::bail!("Degraded node has no folder secrets")
-            }
+            PotentialObject::Degraded(_) => Err(anyhow::Error::new(
+                crate::error::UndecryptableNodeError("Degraded node has no folder secrets".into()),
+            )),
         }
     }
 
@@ -965,6 +1161,8 @@ impl DtoToMetadataConverter {
     /// [`FRESH_NODES_BATCH_SIZE`] links, as the C# SDK's batch loader does. The cache
     /// entries of all given links are evicted first, so links the API no longer
     /// returns (deleted for good) leave no stale entry; they are missing from the result.
+    /// A link whose parent folder cannot be decrypted is returned degraded (see
+    /// [`Self::decode_fresh_links`]); a failed request fails the call.
     pub async fn get_fresh_nodes_metadata(
         client: &ProtonDriveClient,
         volume_id: VolumeId,
@@ -986,23 +1184,127 @@ impl DtoToMetadataConverter {
         })
         .await?;
 
-        let mut results = Vec::new();
-        for response in batches {
-            for link_details in response.links {
-                let parent_key =
-                    Self::resolve_parent_key(client, volume_id.clone(), &link_details).await?;
-                let metadata = Self::convert_dto_to_node_metadata_with_client(
-                    client,
-                    volume_id.clone(),
-                    link_details,
-                    parent_key.as_ref(),
-                )
-                .await?;
-                Self::cache_node_metadata(client, &metadata).await?;
-                results.push(metadata);
-            }
+        let links = batches
+            .into_iter()
+            .flat_map(|response| response.links)
+            .collect();
+        Self::decode_fresh_links(client, volume_id, links).await
+    }
+
+    /// Decodes and caches the links of [`Self::get_fresh_nodes_metadata`], in order.
+    ///
+    /// A link whose parent folder key cannot be had because the parent does not decrypt
+    /// (its secrets are degraded in the cache, or the parent, or a folder above it, fails
+    /// to decrypt when fetched) is returned degraded with the error "Parent folder key is
+    /// degraded", and the others are decoded: one such link must not fail the whole
+    /// batch, which an event-following client asks for again and again. The two cases
+    /// are told apart by type: decryption failures are [`crate::error::UndecryptableNodeError`]s, and
+    /// any other error (a failed request, an API error, a cache failure) fails the call.
+    async fn decode_fresh_links(
+        client: &ProtonDriveClient,
+        volume_id: VolumeId,
+        links: Vec<crate::api::links::LinkDetailsDto>,
+    ) -> anyhow::Result<Vec<NodeMetadataResult>> {
+        let mut results = Vec::with_capacity(links.len());
+        for link_details in links {
+            let parent_key =
+                match Self::resolve_parent_key(client, volume_id.clone(), &link_details).await {
+                    Ok(key) => key,
+                    Err(error) if crate::error::UndecryptableNodeError::is_cause_of(&error) => {
+                        tracing::debug!(
+                            link_id = %link_details.link.id.raw(),
+                            "parent folder key is degraded; returning the node degraded"
+                        );
+                        results.push(PotentialObject::Degraded(
+                            Self::degraded_without_parent_key(&volume_id, link_details),
+                        ));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            let metadata = Self::convert_dto_to_node_metadata_with_client(
+                client,
+                volume_id.clone(),
+                link_details,
+                parent_key.as_ref(),
+            )
+            .await?;
+            Self::cache_node_metadata(client, &metadata).await?;
+            results.push(metadata);
         }
         Ok(results)
+    }
+
+    /// A node whose parent folder key is degraded: nothing of it decrypts (its name,
+    /// passphrase and key are encrypted to that key), so it carries what the link states
+    /// in clear and the error. It is not cached: the parent may decrypt later.
+    fn degraded_without_parent_key(
+        volume_id: &VolumeId,
+        link_details: crate::api::links::LinkDetailsDto,
+    ) -> DegradedNodeMetadata {
+        let error = ProtonDriveError::CryptoError("Parent folder key is degraded".into());
+        let link = link_details.link;
+        let base = DegradedNodeBase {
+            uid: NodeUid::new(volume_id.clone(), link.id.clone()),
+            parent_uid: link.parent_id.map(|id| NodeUid::new(volume_id.clone(), id)),
+            name: PotentialObject::Degraded(error.clone()),
+            creation_time: link.creation_time,
+            trash_time: link.trash_time,
+            owned_by: link
+                .owned_by
+                .as_ref()
+                .map(|o| OwnedBy {
+                    email: o.email.clone(),
+                    organisation: o.organization.clone(),
+                })
+                .unwrap_or_default(),
+            errors: vec![error],
+            ..DegradedNodeBase::default()
+        };
+        let secrets = DegradedNodeSecrets {
+            key: None,
+            passphrase_session_key: None,
+            name_session_key: None,
+        };
+        let inner = match link.r#type {
+            crate::api::links::LinkType::Folder | crate::api::links::LinkType::Album => {
+                DegradedNodeAndSecrets::Folder(
+                    DegradedFolderNode { base },
+                    DegradedFolderSecrets {
+                        base: secrets,
+                        hash_key: None,
+                    },
+                )
+            }
+            crate::api::links::LinkType::File => {
+                let file = link_details
+                    .file
+                    .or(link_details.photo.map(|photo| photo.base));
+                DegradedNodeAndSecrets::File(
+                    DegradedFileNode {
+                        base,
+                        media_type: file
+                            .as_ref()
+                            .map(|file| file.media_type.clone())
+                            .or(link.media_type)
+                            .unwrap_or_default(),
+                        active_revision: None,
+                        total_storage_quota_usage: file
+                            .as_ref()
+                            .map_or(0, |file| file.total_size_on_storage),
+                    },
+                    DegradedFileSecrets {
+                        base: secrets,
+                        content_key: None,
+                    },
+                )
+            }
+        };
+        DegradedNodeMetadata {
+            inner,
+            membership_share_id: link_details.sharing.map(|sharing| sharing.share_id),
+            name_hash_digest: link.name_hash_digest,
+        }
     }
 
     /// Stores a freshly decoded node and its secrets in the client's caches.
@@ -1314,7 +1616,10 @@ impl DtoToMetadataConverter {
                     };
 
                     let passphrase_decryption_output = decryption.link.passphrase.map_err(|e| {
-                        anyhow::anyhow!("Failed to decrypt folder passphrase: {}", e)
+                        crate::error::UndecryptableNodeError(format!(
+                            "Failed to decrypt folder passphrase: {}",
+                            e
+                        ))
                     })?;
                     let passphrase_session_key = passphrase_decryption_output.data.clone();
                     let passphrase_pgp_session_key =
@@ -1351,7 +1656,9 @@ impl DtoToMetadataConverter {
                         name_hash_digest: link_dto.name_hash_digest,
                     }))
                 } else {
-                    Err(anyhow::anyhow!("Decryption failed for folder"))
+                    Err(anyhow::Error::new(crate::error::UndecryptableNodeError(
+                        "Decryption failed for folder".into(),
+                    )))
                 }
             }
             crate::api::links::LinkType::File => {
@@ -1446,10 +1753,12 @@ impl DtoToMetadataConverter {
                         membership,
                     };
 
-                    let passphrase_decryption_output = decryption
-                        .link
-                        .passphrase
-                        .map_err(|e| anyhow::anyhow!("Failed to decrypt file passphrase: {}", e))?;
+                    let passphrase_decryption_output = decryption.link.passphrase.map_err(|e| {
+                        crate::error::UndecryptableNodeError(format!(
+                            "Failed to decrypt file passphrase: {}",
+                            e
+                        ))
+                    })?;
                     let passphrase_session_key = passphrase_decryption_output.data.clone();
                     let passphrase_pgp_session_key =
                         passphrase_decryption_output
@@ -1549,13 +1858,12 @@ impl DtoToMetadataConverter {
                         name_hash_digest: link_dto.name_hash_digest,
                     }))
                 } else {
-                    Err(anyhow::anyhow!(
-                        "Decryption failed for file parent_key={:?} name={:?} content={:?} node={:?}",
-                        parent_err,
-                        name_err,
-                        content_err,
-                        node_err
-                    ))
+                    Err(anyhow::Error::new(crate::error::UndecryptableNodeError(
+                        format!(
+                            "Decryption failed for file parent_key={:?} name={:?} content={:?} node={:?}",
+                            parent_err, name_err, content_err, node_err
+                        ),
+                    )))
                 }
             }
         }

@@ -283,7 +283,11 @@ impl FolderOperations {
             .try_get_folder_secrets(folder_uid.clone())
             .await?
         {
-            return secrets.result().map_err(|e| anyhow::anyhow!(e.to_string()));
+            // A degraded folder has no key: typed, so that a caller reading many
+            // nodes can tell it from a failed request (P13).
+            return secrets.result().map_err(|e| {
+                anyhow::Error::new(crate::error::UndecryptableNodeError(e.to_string()))
+            });
         }
 
         let metadata_result: NodeMetadataResult = Box::pin(
@@ -291,9 +295,7 @@ impl FolderOperations {
         )
         .await?;
 
-        metadata_result
-            .try_get_folder_secrets_else_error()
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
+        metadata_result.try_get_folder_secrets_else_error()
     }
 }
 
