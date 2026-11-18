@@ -17,7 +17,7 @@ use crate::users::{DefaultUsersApiClient, UsersApiClient};
 use crate::utils::AppVersionConfiguration;
 use crate::{
     PasswordMode, SessionId, UserId,
-    auth::{AuthenticationApiClient, TokenCredential, TokenRefreshError},
+    auth::{AuthenticationApiClient, SessionForkPollError, TokenCredential, TokenRefreshError},
     cache::CacheRepository,
     client::{ApiClient, ProtonApiDefaults, ProtonClientConfiguration, ProtonClientOptions},
     secret::DefaultSecretCache,
@@ -268,16 +268,13 @@ impl ProtonAPISession {
         sign_in_url.zeroize();
 
         tokio::time::sleep(FORK_INITIAL_DELAY).await;
-        let started = std::time::Instant::now();
-        let status = loop {
-            if started.elapsed() > FORK_MAX_WAIT {
-                anyhow::bail!("browser sign-in timed out");
-            }
-            match auth_api_client.poll_session_fork(&fork.selector).await? {
-                Some(status) => break status,
-                None => tokio::time::sleep(FORK_POLL_INTERVAL).await,
-            }
-        };
+        let status = collect_session_fork(
+            auth_api_client.as_ref(),
+            &fork.selector,
+            FORK_POLL_INTERVAL,
+            FORK_MAX_WAIT,
+        )
+        .await?;
 
         let key_password =
             Zeroizing::new(decrypt_fork_key_password(&encryption_key, &status.payload)?);
@@ -650,6 +647,78 @@ impl ProtonAPISession {
     }
 }
 
+/// The longest a single fork poll may take before it counts as a transport failure.
+const FORK_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest the invalidation of an abandoned fork may delay the login's error.
+const FORK_INVALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Polls the session fork every `interval` until the browser sign-in has completed.
+///
+/// A poll that fails in transport, times out, or answers 408, 429 or 5xx is retried (after
+/// `Retry-After` when the server sent one) until `max_wait`; any other failure ends the login.
+/// A login that ends without a session invalidates the selector, best effort, so that no fork
+/// stays collectable. Errors never carry the selector.
+async fn collect_session_fork(
+    client: &dyn AuthenticationApiClient,
+    selector: &str,
+    interval: Duration,
+    max_wait: Duration,
+) -> anyhow::Result<crate::api::response::SessionForkStatusResponse> {
+    let result = poll_session_fork_until_ready(client, selector, interval, max_wait).await;
+    if result.is_err() {
+        // Errors are ignored: the fork expires on the server in any case.
+        match tokio::time::timeout(
+            FORK_INVALIDATE_TIMEOUT,
+            client.invalidate_session_fork(selector),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                log::debug!("could not invalidate the abandoned session fork");
+            }
+        }
+    }
+    result
+}
+
+async fn poll_session_fork_until_ready(
+    client: &dyn AuthenticationApiClient,
+    selector: &str,
+    interval: Duration,
+    max_wait: Duration,
+) -> anyhow::Result<crate::api::response::SessionForkStatusResponse> {
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() > max_wait {
+            anyhow::bail!("browser sign-in timed out");
+        }
+        let polled = tokio::time::timeout(
+            FORK_POLL_TIMEOUT.min(max_wait),
+            client.poll_session_fork(selector),
+        )
+        .await;
+        let delay = match polled {
+            Ok(Ok(Some(status))) => return Ok(status),
+            Ok(Ok(None)) => interval,
+            Ok(Err(error)) => match error.downcast_ref::<SessionForkPollError>() {
+                Some(failure) if failure.is_transient() => {
+                    log::warn!("sign-in status check failed, retrying: {error:#}");
+                    failure
+                        .retry_after()
+                        .map_or(interval, |delay| delay.max(interval))
+                }
+                _ => return Err(error),
+            },
+            Err(_) => {
+                log::warn!("sign-in status check timed out, retrying");
+                interval
+            }
+        };
+        tokio::time::sleep(delay.min(max_wait)).await;
+    }
+}
+
 /// Returns the `auth/v4/scopes` URL under the configured API base URL.
 fn scopes_probe_url(base_url: &http::Uri) -> anyhow::Result<reqwest::Url> {
     let mut base = base_url.to_string();
@@ -760,5 +829,194 @@ mod tests {
         let encoded = STANDARD.encode(blob);
         let password = decrypt_fork_key_password(&key, &encoded).unwrap();
         assert_eq!(password, "mailbox-secret");
+    }
+
+    /// Session-fork polls against a local HTTP server.
+    mod fork_poll {
+        use super::*;
+        use crate::auth::DefaultAuthenticationApiClient;
+        use std::sync::Mutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        const SELECTOR: &str = "Sel3ctorThatMustNotLeak";
+        const READY: &str = r#"{"Code":1000,"Payload":"cGF5bG9hZA==","UID":"uid-1","AccessToken":"access","RefreshToken":"refresh","UserID":"user-1"}"#;
+        const INTERVAL: Duration = Duration::from_millis(10);
+        const MAX_WAIT: Duration = Duration::from_secs(10);
+
+        enum Reply {
+            Status(u16, &'static str, Option<&'static str>),
+            /// Closes the connection without an answer.
+            Drop,
+        }
+
+        /// The request lines the server received, in order.
+        type Requests = Arc<Mutex<Vec<String>>>;
+
+        async fn request_line(stream: &mut TcpStream) -> String {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).await.unwrap() == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            head.lines().next().unwrap_or_default().to_owned()
+        }
+
+        /// A client of a server that answers the n-th request (0-based) with `reply(n, line)`.
+        async fn serve(
+            reply: impl Fn(usize, &str) -> Reply + Send + 'static,
+        ) -> (DefaultAuthenticationApiClient, Requests) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = reqwest::Url::parse(&format!("http://{}/", listener.local_addr().unwrap()))
+                .unwrap();
+            let requests = Requests::default();
+            let seen = Arc::clone(&requests);
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let line = request_line(&mut stream).await;
+                    let index = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(line.clone());
+                        seen.len() - 1
+                    };
+                    match reply(index, &line) {
+                        Reply::Drop => drop(stream),
+                        Reply::Status(code, body, retry_after) => {
+                            let retry_after = retry_after
+                                .map(|value| format!("Retry-After: {value}\r\n"))
+                                .unwrap_or_default();
+                            let response = format!(
+                                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            stream.write_all(response.as_bytes()).await.unwrap();
+                            let _ = stream.shutdown().await;
+                        }
+                    }
+                }
+            });
+            let client = DefaultAuthenticationApiClient::with_api_base(
+                reqwest::Client::new(),
+                ProtonApiDefaults::refresh_redirect_uri(),
+                base,
+            );
+            (client, requests)
+        }
+
+        fn poll_line() -> String {
+            format!("GET /auth/v4/sessions/forks/{SELECTOR} HTTP/1.1")
+        }
+
+        fn invalidate_line() -> String {
+            format!("DELETE /auth/v4/sessions/forks/{SELECTOR} HTTP/1.1")
+        }
+
+        #[tokio::test]
+        async fn failed_polls_name_the_path_template_not_the_selector() {
+            let (client, requests) = serve(|index, _| match index {
+                0 => Reply::Status(503, r#"{"Code":503}"#, None),
+                1 => Reply::Drop,
+                2 => Reply::Status(429, r#"{"Code":2028}"#, Some("7")),
+                _ => Reply::Status(400, r#"{"Code":2001}"#, None),
+            })
+            .await;
+            for (transient, retry_after) in [
+                (true, None),
+                (true, None),
+                (true, Some(Duration::from_secs(7))),
+                (false, None),
+            ] {
+                let error = client.poll_session_fork(SELECTOR).await.unwrap_err();
+                let text = format!("{error:#}");
+                assert!(!text.contains(SELECTOR), "{text}");
+                assert!(text.contains("auth/v4/sessions/forks/<selector>"), "{text}");
+                let debug = format!("{error:?}");
+                assert!(!debug.contains(SELECTOR), "{debug}");
+                let failure = error.downcast_ref::<SessionForkPollError>().unwrap();
+                assert_eq!(failure.is_transient(), transient, "{text}");
+                assert_eq!(failure.retry_after(), retry_after, "{text}");
+            }
+            assert_eq!(*requests.lock().unwrap(), vec![poll_line(); 4]);
+        }
+
+        #[tokio::test]
+        async fn a_server_error_is_retried_until_the_fork_is_ready() {
+            let (client, requests) = serve(|index, _| match index {
+                0 => Reply::Status(503, "unavailable", None),
+                1 => Reply::Status(422, r#"{"Code":422}"#, None),
+                _ => Reply::Status(200, READY, None),
+            })
+            .await;
+            let status = collect_session_fork(&client, SELECTOR, INTERVAL, MAX_WAIT)
+                .await
+                .unwrap();
+            assert_eq!(status.session_id.raw(), "uid-1");
+            assert_eq!(*requests.lock().unwrap(), vec![poll_line(); 3]);
+        }
+
+        #[tokio::test]
+        async fn a_dropped_connection_is_retried_until_the_fork_is_ready() {
+            let (client, requests) = serve(|index, _| match index {
+                0 => Reply::Drop,
+                _ => Reply::Status(200, READY, None),
+            })
+            .await;
+            let status = collect_session_fork(&client, SELECTOR, INTERVAL, MAX_WAIT)
+                .await
+                .unwrap();
+            assert_eq!(status.session_id.raw(), "uid-1");
+            assert_eq!(*requests.lock().unwrap(), vec![poll_line(); 2]);
+        }
+
+        #[tokio::test]
+        async fn a_timed_out_sign_in_invalidates_the_selector() {
+            let (client, requests) = serve(|_, line| {
+                if line.starts_with("DELETE ") {
+                    Reply::Status(200, r#"{"Code":1000}"#, None)
+                } else {
+                    Reply::Status(422, r#"{"Code":422}"#, None)
+                }
+            })
+            .await;
+            let error =
+                collect_session_fork(&client, SELECTOR, INTERVAL, Duration::from_millis(100))
+                    .await
+                    .unwrap_err();
+            assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.last(), Some(&invalidate_line()));
+            assert!(
+                requests[..requests.len() - 1]
+                    .iter()
+                    .all(|line| *line == poll_line())
+            );
+        }
+
+        #[tokio::test]
+        async fn a_rejected_poll_ends_the_sign_in_and_invalidates_the_selector() {
+            let (client, requests) = serve(|_, line| {
+                if line.starts_with("DELETE ") {
+                    Reply::Drop
+                } else {
+                    Reply::Status(400, r#"{"Code":2001}"#, None)
+                }
+            })
+            .await;
+            let error = collect_session_fork(&client, SELECTOR, INTERVAL, MAX_WAIT)
+                .await
+                .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(!text.contains(SELECTOR), "{text}");
+            assert!(text.contains("400"), "{text}");
+            assert_eq!(
+                *requests.lock().unwrap(),
+                vec![poll_line(), invalidate_line()]
+            );
+        }
     }
 }
