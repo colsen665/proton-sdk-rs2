@@ -13,6 +13,9 @@ use proton_rpgp::{CheckUnixTime, UnixTime};
 /// Server time minus device time, in seconds.
 static OFFSET_SECONDS: AtomicI64 = AtomicI64::new(0);
 
+/// The smallest change of the offset that a response may make.
+const MIN_OFFSET_CHANGE_SECONDS: u64 = 2;
+
 fn device_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -22,7 +25,19 @@ fn device_now() -> i64 {
 
 /// Records the server time reported by an API response.
 pub fn update(server_unix_seconds: i64) {
-    OFFSET_SECONDS.store(server_unix_seconds - device_now(), Ordering::Relaxed);
+    let observed = server_unix_seconds.saturating_sub(device_now());
+    // Decided against the stored offset, even under concurrent updates; `Err` means kept.
+    let _ = OFFSET_SECONDS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        adopted_offset(current, observed)
+    });
+}
+
+/// The offset to store after observing `observed`, or `None` to keep `current`.
+///
+/// Whole-second clocks read ±1 s off across a second boundary; adopting that
+/// could date a signature before its new key, which rPGP rejects.
+fn adopted_offset(current: i64, observed: i64) -> Option<i64> {
+    (observed.abs_diff(current) >= MIN_OFFSET_CHANGE_SECONDS).then_some(observed)
 }
 
 /// Server time from `x-pm-date`, falling back to `Date`, in Unix seconds.
@@ -89,6 +104,45 @@ pub fn client_with_server_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The offset stored after each observation in turn, from the initial 0.
+    fn offset_after(observations: &[i64]) -> i64 {
+        observations.iter().fold(0, |current, &observed| {
+            adopted_offset(current, observed).unwrap_or(current)
+        })
+    }
+
+    #[test]
+    fn one_second_jitter_is_ignored() {
+        assert_eq!(adopted_offset(0, -1), None);
+        assert_eq!(adopted_offset(0, 1), None);
+        assert_eq!(adopted_offset(0, 0), None);
+        assert_eq!(adopted_offset(-30, -29), None);
+        assert_eq!(adopted_offset(-30, -31), None);
+    }
+
+    #[test]
+    fn a_change_of_two_seconds_or_more_is_adopted() {
+        assert_eq!(adopted_offset(0, 2), Some(2));
+        assert_eq!(adopted_offset(0, -2), Some(-2));
+        assert_eq!(adopted_offset(5, 3), Some(3));
+        assert_eq!(adopted_offset(0, 3_600), Some(3_600));
+        assert_eq!(adopted_offset(i64::MIN, i64::MAX), Some(i64::MAX));
+    }
+
+    #[test]
+    fn alternating_jitter_around_zero_keeps_the_offset() {
+        assert_eq!(offset_after(&[0, -1, 0, -1, 0, -1]), 0);
+        assert_eq!(offset_after(&[-1, 0, -1, 1, 0]), 0);
+    }
+
+    #[test]
+    fn a_large_offset_is_adopted_first_then_jitter_around_it_is_ignored() {
+        assert_eq!(offset_after(&[-120]), -120);
+        assert_eq!(offset_after(&[-120, -121, -120, -119, -121]), -120);
+        assert_eq!(offset_after(&[-120, -121, -118]), -118);
+        assert_eq!(offset_after(&[-120, 0]), 0);
+    }
 
     #[test]
     fn server_time_prefers_pm_date_then_date_and_ignores_invalid_values() {
