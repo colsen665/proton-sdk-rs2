@@ -648,6 +648,114 @@ mod tests {
         assert_eq!(error.to_string(), "Decryption failed for folder");
     }
 
+    /// Folder link details under `parent_key` whose name is signed by `name_signer`;
+    /// the passphrase is signed by the parent key and the hash key by the node key, as an
+    /// anonymous upload signs them, and `email` is the claimed author of both.
+    fn signed_folder_link(
+        id: &str,
+        parent_key: &PgpPrivateKey,
+        name_signer: &PgpPrivateKey,
+        email: Option<&str>,
+    ) -> crate::api::links::LinkDetailsDto {
+        use crate::crypto::CryptoGenerator;
+        use crate::node::crypto::NodeCrypto;
+        let folder_key = CryptoGenerator::generate_private_key().unwrap();
+        let passphrase = CryptoGenerator::generate_passphrase();
+        let locked_key = folder_key
+            .to_armored_private_key(Some(passphrase.as_bytes()))
+            .unwrap();
+        let (encrypted_passphrase, passphrase_signature, _) =
+            NodeCrypto::encrypt_and_sign_passphrase(passphrase.as_bytes(), parent_key, parent_key)
+                .unwrap();
+        let (name, name_hash, _) = NodeCrypto::encrypt_and_sign_name(
+            id,
+            &CryptoGenerator::generate_folder_hash_key(),
+            parent_key,
+            name_signer,
+        )
+        .unwrap();
+        let hash_key = NodeCrypto::encrypt_folder_hash_key(
+            &folder_key,
+            &CryptoGenerator::generate_folder_hash_key(),
+            &folder_key,
+        )
+        .unwrap();
+        serde_json::from_value(serde_json::json!({
+            "Link": {
+                "LinkID": id, "ParentLinkID": "parent", "Type": 1, "State": 1,
+                "CreateTime": 1_600_000_000, "ModifyTime": 1_600_000_000,
+                "Name": name.0, "NameHash": hex::encode(name_hash),
+                "NodeKey": locked_key.0, "NodePassphrase": encrypted_passphrase.0,
+                "NodePassphraseSignature": passphrase_signature.unwrap().0,
+                "SignatureEmail": email, "NameSignatureEmail": email
+            },
+            "Folder": { "NodeHashKey": hash_key.0 }
+        }))
+        .unwrap()
+    }
+
+    async fn authors(
+        client: &ProtonDriveClient,
+        link: crate::api::links::LinkDetailsDto,
+        parent_key: &PgpPrivateKey,
+    ) -> (String, bool, bool) {
+        let node = DtoToMetadataConverter::convert_dto_to_node_metadata_with_client(
+            client,
+            VolumeId::new("volume".into()),
+            link,
+            Some(parent_key),
+        )
+        .await
+        .expect("the node decodes")
+        .get_node_or_throw()
+        .unwrap();
+        let base = node.base().clone();
+        (
+            base.name,
+            matches!(base.name_author, PotentialObject::Node(_)),
+            matches!(base.author, PotentialObject::Node(_)),
+        )
+    }
+
+    /// R8 (P27): a signature that does not verify is kept on the node as a degraded
+    /// author, as the official SDKs keep it; the node itself still decodes.
+    #[tokio::test]
+    async fn verification_failures_are_kept_on_the_node() {
+        let (client, _) = crate::test_support::client().await;
+        let parent_key = crate::crypto::CryptoGenerator::generate_private_key().unwrap();
+        let stranger = crate::crypto::CryptoGenerator::generate_private_key().unwrap();
+
+        let signed = signed_folder_link("signed", &parent_key, &parent_key, None);
+        assert_eq!(
+            authors(&client, signed, &parent_key).await,
+            ("signed".into(), true, true)
+        );
+        let renamed = signed_folder_link("renamed", &parent_key, &stranger, None);
+        assert_eq!(
+            authors(&client, renamed, &parent_key).await,
+            ("renamed".into(), false, true),
+            "a name signed by a stranger is not verified"
+        );
+    }
+
+    /// R8 (P27): a named author whose keys cannot be had verifies nothing, so the node's
+    /// and the name's author are unverified (the test account answers no keys).
+    #[tokio::test]
+    async fn a_named_author_without_keys_is_not_verified() {
+        let (client, _) = crate::test_support::client().await;
+        let parent_key = crate::crypto::CryptoGenerator::generate_private_key().unwrap();
+        let link = signed_folder_link(
+            "named",
+            &parent_key,
+            &parent_key,
+            Some("author@example.test"),
+        );
+        assert_eq!(
+            authors(&client, link, &parent_key).await,
+            ("named".into(), false, false)
+        );
+    }
+
     /// The error of a degraded folder's secrets is told apart by type, not by its text.
     #[tokio::test]
     async fn degraded_folder_secrets_are_an_undecryptable_node_error() {
@@ -1950,12 +2058,17 @@ impl DtoToMetadataConverter {
                         name: name.data.clone(),
                         creation_time: link_dto.creation_time,
                         trash_time: link_dto.trash_time,
-                        name_author: PotentialObject::Node(crate::author::Author {
-                            email_address: link_dto.name_signature_email_address.clone(),
-                        }),
-                        author: PotentialObject::Node(crate::author::Author {
-                            email_address: link_dto.signature_email_address.clone(),
-                        }),
+                        // A failed check is kept on the node; the node stays usable (R8).
+                        name_author: link
+                            .name_authorship_claim
+                            .to_verified_author(name.authorship_verification_failure.as_ref()),
+                        author: link.node_authorship_claim.to_verified_author(
+                            _hash_key.authorship_verification_failure.as_ref().or(
+                                passphrase_decryption_output
+                                    .authorship_verification_failure
+                                    .as_ref(),
+                            ),
+                        ),
                         owned_by: link_dto.owned_by.as_ref().map(|o| OwnedBy {
                             email: o.email.clone(),
                             organisation: o.organization.clone(),
@@ -2111,12 +2224,15 @@ impl DtoToMetadataConverter {
                         name: name.data.clone(),
                         creation_time: link_dto.creation_time,
                         trash_time: link_dto.trash_time,
-                        name_author: PotentialObject::Node(crate::author::Author {
-                            email_address: link_dto.name_signature_email_address.clone(),
-                        }),
-                        author: PotentialObject::Node(crate::author::Author {
-                            email_address: link_dto.signature_email_address.clone(),
-                        }),
+                        // A failed check is kept on the node; the node stays usable (R8).
+                        name_author: link
+                            .name_authorship_claim
+                            .to_verified_author(name.authorship_verification_failure.as_ref()),
+                        author: link.node_authorship_claim.to_verified_author(
+                            passphrase_decryption_output
+                                .authorship_verification_failure
+                                .as_ref(),
+                        ),
                         owned_by: link_dto.owned_by.as_ref().map(|o| OwnedBy {
                             email: o.email.clone(),
                             organisation: o.organization.clone(),
@@ -2160,13 +2276,19 @@ impl DtoToMetadataConverter {
                                     base: node_base,
                                     media_type: file_dto.media_type.clone(),
                                 },
-                                active_revision:
-                                    crate::node::revision::Revision::from_active_revision_dto(
+                                active_revision: crate::node::revision::Revision {
+                                    content_author: Some(
+                                        content_authorship_claim.to_verified_author(
+                                            _content_key.authorship_verification_failure.as_ref(),
+                                        ),
+                                    ),
+                                    ..crate::node::revision::Revision::from_active_revision_dto(
                                         &uid,
                                         file_dto.active_revision.as_ref(),
                                         node_key,
                                         &content_authorship_claim,
-                                    ),
+                                    )
+                                },
                                 total_size_on_cloud_storage: file_dto.total_size_on_storage,
                             },
                             secrets,

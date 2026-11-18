@@ -22,6 +22,13 @@ pub struct AuthorshipVerificationFailure {
     pub status: i32,
 }
 
+impl AuthorshipVerificationFailure {
+    /// The signature is missing or does not verify with the claimed author's keys.
+    pub const FAILED: i32 = 1;
+    /// The claimed author's keys could not be had, so nothing was verified.
+    pub const NO_VERIFICATION_KEYS: i32 = 2;
+}
+
 #[derive(Debug)]
 pub struct DecryptionOutput<T> {
     pub data: T,
@@ -34,7 +41,12 @@ pub struct LinkDecryptionResult {
     pub name: Result<DecryptionOutput<String>, Option<String>>,
     pub node_key: Result<PgpPrivateKey, String>,
     pub passphrase: Result<DecryptionOutput<PgpSessionKey>, String>,
+    /// The node's author (`SignatureEmail`): the passphrase, hash key and content key
+    /// are checked against it.
     pub node_authorship_claim: AuthorshipClaim,
+    /// The name's author (`NameSignatureEmail`), which a rename by another member makes
+    /// differ from the node's.
+    pub name_authorship_claim: AuthorshipClaim,
 }
 
 pub struct FileDecryptionResult {
@@ -213,12 +225,14 @@ impl NodeCrypto {
         )
         .await;
 
+        // The content key is signed by the node's author (or its node key), as C#'s
+        // `DecryptFileAsync` checks it; the revision's author signs the content.
         let node_key = link_decryption_result.node_key.as_ref().ok();
         let content_key_result = Self::decrypt_content_key(
             node_key,
             &file.content_key_packet,
             file.content_key_signature.as_ref(),
-            &content_authorship_claim,
+            &link_decryption_result.node_authorship_claim,
         );
 
         FileDecryptionResult {
@@ -267,27 +281,26 @@ impl NodeCrypto {
             None => return Err(Some("Folder information missing".to_string())),
         };
 
-        match Self::decrypt_message(
-            encrypted_hash_key,
-            None,
-            std::iter::once(node_key),
-            authorship_claim,
-        ) {
+        // Signed by the node's author or by the node key itself.
+        let claim = authorship_claim.verification_claim([], [node_key]);
+        match Self::decrypt_message(encrypted_hash_key, None, std::iter::once(node_key), &claim) {
             Ok((data, session_key, failure)) => Ok(DecryptionOutput {
                 data,
                 session_key,
-                authorship_verification_failure: failure,
+                authorship_verification_failure: claim.checked(failure),
             }),
             Err(e) => Err(Some(e)),
         }
     }
 
-    /// Decrypts the content key packet for a file revision using `node_key`, returning the raw PGP session key.
+    /// Decrypts the content key packet for a file revision using `node_key`, returning the raw PGP session key,
+    /// and verifies `ContentKeySignature` over the key with the node key and the node author's keys, as C#'s
+    /// `DecryptContentKey` does: a missing or bad signature is a verification failure, not an error.
     pub fn decrypt_content_key(
         node_key: Option<&PgpPrivateKey>,
         content_key_packet: &[u8],
-        _content_key_signature: Option<&PgpArmoredSignature>,
-        _node_authorship_claim: &AuthorshipClaim,
+        content_key_signature: Option<&PgpArmoredSignature>,
+        node_authorship_claim: &AuthorshipClaim,
     ) -> Result<DecryptionOutput<PgpSessionKey>, Option<String>> {
         let node_key = match node_key {
             Some(k) => k,
@@ -298,11 +311,25 @@ impl NodeCrypto {
             .with_decryption_key(&node_key.0)
             .decrypt_session_key(content_key_packet)
         {
-            Ok(sk) => Ok(DecryptionOutput {
-                data: crate::pgp::PgpSessionKey::from_rpgp(&sk),
-                session_key: Some(sk),
-                authorship_verification_failure: None,
-            }),
+            Ok(sk) => {
+                let data = crate::pgp::PgpSessionKey::from_rpgp(&sk);
+                let claim = node_authorship_claim.verification_claim([], [node_key]);
+                let verified = content_key_signature.is_some_and(|signature| {
+                    proton_rpgp::Verifier::default()
+                        .with_verification_keys(claim.keys.iter())
+                        .verify_detached(&data.key, signature.0.as_bytes(), DataEncoding::Auto)
+                        .is_ok()
+                });
+                Ok(DecryptionOutput {
+                    data,
+                    session_key: Some(sk),
+                    authorship_verification_failure: (!verified).then_some(
+                        AuthorshipVerificationFailure {
+                            status: AuthorshipVerificationFailure::FAILED,
+                        },
+                    ),
+                })
+            }
             Err(e) => Err(Some(e.to_string())),
         }
     }
@@ -315,18 +342,38 @@ impl NodeCrypto {
     ) -> LinkDecryptionResult {
         let node_authorship_claim =
             crate::node::authorship::NodeAuthorshipClaimProvider::get_node_authorship_claim(
-                account_client,
+                account_client.clone(),
                 link,
             )
             .await;
+        let name_authorship_claim = if link.name_signature_email_address
+            == link.signature_email_address
+        {
+            node_authorship_claim.clone()
+        } else {
+            AuthorshipClaim::create(account_client, link.name_signature_email_address.as_deref())
+                .await
+        };
+        // Anonymous uploads are signed with the parent's key; a root has none to check with.
+        let anonymous_keys: &[PgpPrivateKey] = match (&parent_keys_result, &link.parent_id) {
+            (Ok(pks), Some(_)) => pks,
+            _ => &[],
+        };
+        let passphrase_claim = node_authorship_claim.verification_claim(anonymous_keys, []);
+        let name_claim = name_authorship_claim.verification_claim(anonymous_keys, []);
 
         let passphrase_output = match &parent_keys_result {
             Ok(pks) => Self::decrypt_passphrase(
                 pks,
                 &link.passphrase,
                 link.passphrase_signature.as_ref(),
-                &node_authorship_claim,
-            ),
+                &passphrase_claim,
+            )
+            .map(|mut output| {
+                output.authorship_verification_failure =
+                    passphrase_claim.checked(output.authorship_verification_failure.take());
+                output
+            }),
             Err(e) => Err(e.clone()),
         };
 
@@ -344,28 +391,25 @@ impl NodeCrypto {
                 for pk in pks {
                     keys.push(pk);
                 }
-                match Self::decrypt_message(&link.name, None, keys, &node_authorship_claim) {
+                match Self::decrypt_message(&link.name, None, keys, &name_claim) {
                     Ok((data, session_key, failure)) => Ok(DecryptionOutput {
                         data: String::from_utf8_lossy(&data).to_string(),
                         session_key,
-                        authorship_verification_failure: failure,
+                        authorship_verification_failure: name_claim.checked(failure),
                     }),
                     Err(e) => Err(Some(e)),
                 }
             }
-            (Ok(nk), _) => match Self::decrypt_message(
-                &link.name,
-                None,
-                std::iter::once(nk),
-                &node_authorship_claim,
-            ) {
-                Ok((data, session_key, failure)) => Ok(DecryptionOutput {
-                    data: String::from_utf8_lossy(&data).to_string(),
-                    session_key,
-                    authorship_verification_failure: failure,
-                }),
-                Err(e) => Err(Some(e)),
-            },
+            (Ok(nk), _) => {
+                match Self::decrypt_message(&link.name, None, std::iter::once(nk), &name_claim) {
+                    Ok((data, session_key, failure)) => Ok(DecryptionOutput {
+                        data: String::from_utf8_lossy(&data).to_string(),
+                        session_key,
+                        authorship_verification_failure: name_claim.checked(failure),
+                    }),
+                    Err(e) => Err(Some(e)),
+                }
+            }
             _ => Err(None),
         };
 
@@ -374,6 +418,7 @@ impl NodeCrypto {
             node_key,
             passphrase: passphrase_output,
             node_authorship_claim,
+            name_authorship_claim,
         }
     }
 
@@ -491,3 +536,60 @@ impl NodeCrypto {
 }
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::author::Author;
+    use crate::crypto::CryptoGenerator;
+
+    fn anonymous() -> AuthorshipClaim {
+        AuthorshipClaim {
+            keys: vec![],
+            author: Author::ANONYMOUS,
+            key_retrieval_error_message: None,
+        }
+    }
+
+    /// R8 (P27): `ContentKeySignature` is checked with the node key (and the node
+    /// author's keys); a missing or foreign signature is a verification failure, and the
+    /// content key is still returned.
+    #[test]
+    fn the_content_key_signature_is_verified() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let stranger = CryptoGenerator::generate_private_key().unwrap();
+        let content_key = CryptoGenerator::generate_session_key();
+        let packet = node_key.encrypt_session_key(&content_key).unwrap();
+        let good = node_key.sign_detached_armored(&content_key.key).unwrap();
+        let foreign = stranger.sign_detached_armored(&content_key.key).unwrap();
+
+        for (signature, verified) in [(Some(&good), true), (Some(&foreign), false), (None, false)] {
+            let output =
+                NodeCrypto::decrypt_content_key(Some(&node_key), &packet, signature, &anonymous())
+                    .expect("the content key decrypts");
+            assert_eq!(output.data.key, content_key.key);
+            assert_eq!(
+                output.authorship_verification_failure.is_none(),
+                verified,
+                "{signature:?}"
+            );
+        }
+    }
+
+    /// The hash key is checked against the node key as well as the author's keys.
+    #[test]
+    fn a_hash_key_signed_by_its_node_key_verifies() {
+        let node_key = CryptoGenerator::generate_private_key().unwrap();
+        let stranger = CryptoGenerator::generate_private_key().unwrap();
+        let hash_key = CryptoGenerator::generate_folder_hash_key();
+        for (signer, verified) in [(&node_key, true), (&stranger, false)] {
+            let encrypted =
+                NodeCrypto::encrypt_folder_hash_key(&node_key, &hash_key, signer).unwrap();
+            let output =
+                NodeCrypto::decrypt_hash_key(Some(&encrypted), Some(&node_key), &anonymous())
+                    .expect("the hash key decrypts");
+            assert_eq!(output.data, hash_key);
+            assert_eq!(output.authorship_verification_failure.is_none(), verified);
+        }
+    }
+}
