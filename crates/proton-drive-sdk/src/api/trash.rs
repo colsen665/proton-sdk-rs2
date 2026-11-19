@@ -136,11 +136,12 @@ impl TrashApiClient for DefaultTrashApiClient {
         ))?;
         let builder = self.client.put(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<AggregateApiResponse<LinkIdResponsePair>>()
-            .await?)
+        Ok(
+            crate::api::parse_json_response::<AggregateApiResponse<LinkIdResponsePair>>(
+                builder.send().await?,
+            )
+            .await?,
+        )
     }
 
     async fn delete_multiple(
@@ -154,11 +155,12 @@ impl TrashApiClient for DefaultTrashApiClient {
         ))?;
         let builder = self.client.post(url).json(&request);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder
-            .send()
-            .await?
-            .json::<AggregateApiResponse<LinkIdResponsePair>>()
-            .await?)
+        Ok(
+            crate::api::parse_json_response::<AggregateApiResponse<LinkIdResponsePair>>(
+                builder.send().await?,
+            )
+            .await?,
+        )
     }
 
     async fn empty(&self, volume_id: VolumeId) -> anyhow::Result<ApiResponse> {
@@ -167,6 +169,6 @@ impl TrashApiClient for DefaultTrashApiClient {
             .join(&format!("volumes/{}/trash", volume_id.raw()))?;
         let builder = self.client.delete(url);
         let builder = self.add_auth_headers(builder).await?;
-        Ok(builder.send().await?.json::<ApiResponse>().await?)
+        Ok(crate::api::parse_json_response::<ApiResponse>(builder.send().await?).await?)
     }
 }

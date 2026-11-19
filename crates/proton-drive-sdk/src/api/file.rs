@@ -158,30 +158,7 @@ pub trait FilesApiClient: Send + Sync {
 }
 use proton_sdk_rs2::auth::TokenCredential;
 
-/// Parse an HTTP response as JSON, including the raw body text in the error
-/// message on failure so that Proton error pages are visible in logs.
-async fn parse_json_response<T: serde::de::DeserializeOwned>(
-    resp: reqwest::Response,
-) -> anyhow::Result<T> {
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        // Try to extract a Proton error message from the JSON body.
-        if let Ok(api) = serde_json::from_str::<ApiResponse>(&body) {
-            if let Some(msg) = &api.error_message {
-                return Err(anyhow::anyhow!("API error {}: {}", api.code.0, msg));
-            }
-        }
-        return Err(anyhow::anyhow!("HTTP {}: {}", status, body));
-    }
-    serde_json::from_str::<T>(&body).map_err(|e| {
-        anyhow::anyhow!(
-            "JSON parse error: {}. Body: {}",
-            e,
-            &body[..body.len().min(512)]
-        )
-    })
-}
+use super::parse_json_response;
 
 pub struct DefaultFilesApiClient {
     client: ClientWithMiddleware,
@@ -332,7 +309,7 @@ impl FilesApiClient for DefaultFilesApiClient {
         let builder = self.client.get(url);
         let builder = self.add_auth_headers(builder).await?;
 
-        Ok(builder.send().await?.json::<RevisionResponse>().await?)
+        parse_json_response::<RevisionResponse>(builder.send().await?).await
     }
 
     async fn get_revisions(

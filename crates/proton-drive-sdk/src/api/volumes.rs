@@ -56,11 +56,10 @@ impl VolumesApiClient for DefaultVolumesApiClient {
             request_builder = request_builder.header("x-pm-uid", credential.session_id().raw());
         }
 
-        let response = request_builder
-            .send()
-            .await?
-            .json::<VolumeCreationResponse>()
-            .await?;
+        let response = crate::api::parse_json_response::<VolumeCreationResponse>(
+            request_builder.send().await?,
+        )
+        .await?;
 
         Ok(response)
     }
@@ -78,11 +77,9 @@ impl VolumesApiClient for DefaultVolumesApiClient {
             request_builder = request_builder.header("x-pm-uid", credential.session_id().raw());
         }
 
-        let response = request_builder
-            .send()
-            .await?
-            .json::<VolumeResponse>()
-            .await?;
+        let response =
+            crate::api::parse_json_response::<VolumeResponse>(request_builder.send().await?)
+                .await?;
 
         Ok(response)
     }

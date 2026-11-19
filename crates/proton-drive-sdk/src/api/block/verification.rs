@@ -77,11 +77,10 @@ impl BlockVerificationApiClient for DefaultBlockVerificationApiClient {
             request_builder = request_builder.header("x-pm-uid", credential.session_id().raw());
         }
 
-        let response = request_builder
-            .send()
-            .await?
-            .json::<BlockVerificationInputResponse>()
-            .await?;
+        let response = crate::api::parse_json_response::<BlockVerificationInputResponse>(
+            request_builder.send().await?,
+        )
+        .await?;
 
         Ok(response)
     }

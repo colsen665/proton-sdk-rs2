@@ -194,10 +194,12 @@ impl ProtonDriveClient {
                 .join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
 
         Self::from_http_clients(
-            crate::server_time::client_with_server_time(
-                default_api_http_client,
-                &default_api_base_address,
-            ),
+            reqwest_middleware::ClientBuilder::new(default_api_http_client)
+                .with(crate::http::retry::DriveApiRetryMiddleware::default())
+                .with(crate::server_time::ServerTimeMiddleware::for_api(
+                    &default_api_base_address,
+                ))
+                .build(),
             // Block storage answers do not set the server time.
             reqwest_middleware::ClientBuilder::new(storage_api_http_client).build(),
             default_api_base_address,
@@ -295,7 +297,12 @@ impl ProtonDriveClient {
             reqwest::Url::parse(&api_base_url)?.join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
 
         Self::from_http_clients(
-            crate::server_time::client_with_server_time(default_api_http_client, &base_address),
+            reqwest_middleware::ClientBuilder::new(default_api_http_client)
+                .with(crate::http::retry::DriveApiRetryMiddleware::default())
+                .with(crate::server_time::ServerTimeMiddleware::for_api(
+                    &base_address,
+                ))
+                .build(),
             // Block storage answers do not set the server time.
             reqwest_middleware::ClientBuilder::new(storage_api_http_client).build(),
             base_address.clone(),
