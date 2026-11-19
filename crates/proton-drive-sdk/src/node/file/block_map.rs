@@ -4,6 +4,11 @@
 //! without listing the revision again: the content key, each block's storage
 //! URL, token and hash, and, when the uploader declared them, the plaintext
 //! block sizes used to map byte offsets to blocks.
+//!
+//! A reader that lists only the blocks it reads uses the pieces instead (P30):
+//! [`ProtonDriveClient::get_block_page`] for one page from any index,
+//! [`ProtonDriveClient::verify_listed_block_hashes`] once every page is known,
+//! and [`ProtonDriveClient::listed_block_sizes`].
 
 use crate::api::block::{BlockDto, BlockListingRevisionDto};
 use crate::client::ProtonDriveClient;
@@ -251,23 +256,35 @@ pub fn verify_block_listing(
         .iter()
         .find(|block| block.hash_digest.is_empty())
     {
-        return Err(DataIntegrityException::new(format!(
-            "Part of the file appears to be corrupted: block #{} has no listed hash",
-            block.index
-        ))
-        .into());
+        return Err(no_listed_hash(block.index));
     }
-    let revision = &listing.revision;
+    let hashes: Vec<&[u8]> = listing
+        .blocks
+        .iter()
+        .map(|block| block.hash_digest.as_slice())
+        .collect();
+    verify_block_hashes(&listing.revision, &hashes, verification_keys)
+}
+
+/// [`verify_block_listing`] for a listing read page by page (P30): `revision`
+/// is the revision of any of its pages (each carries the thumbnails and the
+/// manifest signature), `hashes` the listed hash of every block, block 1
+/// first, without a gap.
+pub fn verify_block_hashes(
+    revision: &crate::api::revision::RevisionDto,
+    hashes: &[&[u8]],
+    verification_keys: &[proton_rpgp::PublicKey],
+) -> anyhow::Result<()> {
+    if let Some(position) = hashes.iter().position(|hash| hash.is_empty()) {
+        return Err(no_listed_hash(position as i32 + 1));
+    }
     let manifest = build_revision_manifest(
         revision
             .thumbnails
             .iter()
             .flatten()
             .map(|thumbnail| (thumbnail.r#type, thumbnail.hash_digest.as_slice())),
-        listing
-            .blocks
-            .iter()
-            .map(|block| block.hash_digest.as_slice()),
+        hashes.iter().copied(),
     );
     verify_manifest_signature(
         &manifest,
@@ -275,6 +292,47 @@ pub fn verify_block_listing(
         verification_keys,
     )?;
     Ok(())
+}
+
+fn no_listed_hash(index: i32) -> anyhow::Error {
+    DataIntegrityException::new(format!(
+        "Part of the file appears to be corrupted: block #{index} has no listed hash"
+    ))
+    .into()
+}
+
+/// Checks one page of a revision's block listing, asked for from
+/// `from_block_index` (P30): sorts it by index, as `RevisionReader` in the C#
+/// SDK does, and requires the blocks from `from_block_index` on without a gap
+/// or a repeat; otherwise this fails with [`DataIntegrityException`]
+/// ("File contents are incomplete"). An empty page is past the last block. A
+/// page may hold fewer blocks than asked for without being the last: only an
+/// empty page ends a listing for certain.
+pub fn check_block_page(
+    from_block_index: i32,
+    mut blocks: Vec<BlockDto>,
+) -> anyhow::Result<Vec<BlockDto>> {
+    anyhow::ensure!(
+        from_block_index >= crate::node::download::MIN_BLOCK_INDEX,
+        "block pages start at index {}, not {from_block_index}",
+        crate::node::download::MIN_BLOCK_INDEX
+    );
+    blocks.sort_by_key(|block| block.index);
+    for (expected, block) in (from_block_index..).zip(&blocks) {
+        if block.index != expected {
+            log::warn!(
+                "Missing block #{expected} in revision block page (got #{})",
+                block.index
+            );
+            return Err(DataIntegrityException::new(format!(
+                "{}: expected block #{expected}, got #{}",
+                crate::node::download::INCOMPLETE_FILE_CONTENTS_MESSAGE,
+                block.index
+            ))
+            .into());
+        }
+    }
+    Ok(blocks)
 }
 
 /// Decrypts a revision's extended attributes and returns `Common.BlockSizes`, or
@@ -408,20 +466,113 @@ impl ProtonDriveClient {
             return Err(error);
         }
 
-        let sizes = match revision.revision.extended_attributes.as_ref() {
+        let sizes = self
+            .revision_block_sizes(&revision_uid, &revision.revision, &secrets.base.key)
+            .await;
+
+        Ok(BlockMap::from_parts(
+            revision_uid,
+            secrets.content_key,
+            revision.blocks,
+            sizes.as_deref(),
+        ))
+    }
+
+    /// One page of a revision's block listing (P30): the blocks from
+    /// `from_block_index` on, at most `page_size` of them, checked with
+    /// [`check_block_page`], with the revision the answer carries (its
+    /// thumbnails, manifest signature and XAttr). For readers that list
+    /// only the blocks they read, block offsets coming from the claimed
+    /// block sizes; the hashes are authenticated once every page is known,
+    /// with [`ProtonDriveClient::verify_listed_block_hashes`].
+    pub async fn get_block_page(
+        &self,
+        revision_uid: &RevisionUid,
+        from_block_index: i32,
+        page_size: i32,
+    ) -> anyhow::Result<BlockListingRevisionDto> {
+        anyhow::ensure!(
+            page_size > 0,
+            "block page size must be positive, got {page_size}"
+        );
+        let response = self
+            .api()
+            .files()
+            .get_revision(
+                revision_uid.node_uid.volume_id.clone(),
+                revision_uid.node_uid.link_id.clone(),
+                revision_uid.revision_id.clone(),
+                Some(from_block_index),
+                Some(page_size),
+                false,
+            )
+            .await?;
+        let BlockListingRevisionDto { revision, blocks } = response.revision;
+        Ok(BlockListingRevisionDto {
+            revision,
+            blocks: check_block_page(from_block_index, blocks)?,
+        })
+    }
+
+    /// [`verify_block_hashes`] with the keys [`ProtonDriveClient::get_block_map`]
+    /// uses (P30): the node key when the revision has no signature email, else
+    /// that address's keys. `hashes` holds every block's listed hash in index
+    /// order, from pages read with [`ProtonDriveClient::get_block_page`].
+    pub async fn verify_listed_block_hashes(
+        &self,
+        revision_uid: &RevisionUid,
+        revision: &crate::api::revision::RevisionDto,
+        hashes: &[&[u8]],
+    ) -> anyhow::Result<()> {
+        let secrets =
+            crate::node::file::FileOperations::get_secrets(self, revision_uid.node_uid.clone())
+                .await?;
+        let verification_keys = manifest_verification_keys(
+            self,
+            revision.signature_email_address.as_deref(),
+            &secrets.base.key,
+        )
+        .await?;
+        verify_block_hashes(revision, hashes, &verification_keys).inspect_err(|error| {
+            log::warn!(
+                "Block listing verification failed for revision \"{}\": {:#}",
+                revision_uid,
+                error
+            );
+        })
+    }
+
+    /// The claimed plaintext block sizes of a listed revision (P30), as
+    /// [`ProtonDriveClient::get_block_map`] reads them: from the XAttr of
+    /// `revision`, else from the revision listing; `None` when the revision
+    /// declares none or they cannot be read (logged).
+    pub async fn listed_block_sizes(
+        &self,
+        revision_uid: &RevisionUid,
+        revision: &crate::api::revision::RevisionDto,
+    ) -> anyhow::Result<Option<Vec<i32>>> {
+        let secrets =
+            crate::node::file::FileOperations::get_secrets(self, revision_uid.node_uid.clone())
+                .await?;
+        Ok(self
+            .revision_block_sizes(revision_uid, revision, &secrets.base.key)
+            .await)
+    }
+
+    async fn revision_block_sizes(
+        &self,
+        revision_uid: &RevisionUid,
+        revision: &crate::api::revision::RevisionDto,
+        node_key: &PgpPrivateKey,
+    ) -> Option<Vec<i32>> {
+        match revision.extended_attributes.as_ref() {
             Some(xattr) => {
-                decrypt_claimed_block_sizes(
-                    self,
-                    &revision_uid.node_uid,
-                    &revision.revision,
-                    xattr,
-                    &secrets.base.key,
-                )
-                .await
+                decrypt_claimed_block_sizes(self, &revision_uid.node_uid, revision, xattr, node_key)
+                    .await
             }
             // Fall back to the revision listing, which FileDownloader::claimed_block_sizes
             // has always used.
-            None => listed_claimed_block_sizes(self, &revision_uid, &secrets.base.key).await,
+            None => listed_claimed_block_sizes(self, revision_uid, node_key).await,
         }
         .unwrap_or_else(|error| {
             log::warn!(
@@ -430,14 +581,7 @@ impl ProtonDriveClient {
                 error
             );
             None
-        });
-
-        Ok(BlockMap::from_parts(
-            revision_uid,
-            secrets.content_key,
-            revision.blocks,
-            sizes.as_deref(),
-        ))
+        })
     }
 
     /// Downloads, verifies and decrypts one block of a [`BlockMap`].
@@ -799,6 +943,74 @@ mod tests {
         ];
         assert!(map.apply_refreshed_blocks(changed).is_err());
         assert_eq!(map.entry(1).unwrap().token, "token-1");
+    }
+
+    fn indices(blocks: &[BlockDto]) -> Vec<i32> {
+        blocks.iter().map(|block| block.index).collect()
+    }
+
+    fn is_incomplete(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<DataIntegrityException>().is_some()
+            && error
+                .to_string()
+                .contains(crate::node::download::INCOMPLETE_FILE_CONTENTS_MESSAGE)
+    }
+
+    /// P30: a page from any index is sorted and must hold the blocks from that
+    /// index on without a gap; an empty page is past the end.
+    #[test]
+    fn a_block_page_is_sorted_and_contiguous_from_its_start() {
+        let page = check_block_page(21, vec![block(23), block(21), block(22)]).unwrap();
+        assert_eq!(indices(&page), [21, 22, 23]);
+        assert_eq!(indices(&check_block_page(1, vec![block(1)]).unwrap()), [1]);
+        assert!(check_block_page(41, Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_block_page_with_a_gap_or_another_start_is_incomplete() {
+        for (from, page) in [
+            (21, vec![block(22), block(23)]),
+            (21, vec![block(21), block(23)]),
+            (21, vec![block(21), block(21)]),
+            (1, vec![block(0), block(1)]),
+        ] {
+            let error = check_block_page(from, page).unwrap_err();
+            assert!(is_incomplete(&error), "{error:#}");
+        }
+        assert!(
+            check_block_page(0, vec![block(0)]).is_err(),
+            "indices start at 1"
+        );
+    }
+
+    /// P30: the hashes of a listing made page by page verify as the whole
+    /// listing does.
+    #[test]
+    fn block_hashes_from_pages_verify_as_the_listing() {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        let listing = signed_listing(&key, 3);
+        let hashes: Vec<&[u8]> = listing
+            .blocks
+            .iter()
+            .map(|block| block.hash_digest.as_slice())
+            .collect();
+        verify_block_hashes(&listing.revision, &hashes, &[public_key(&key)]).unwrap();
+
+        let tampered = [hashes[0], &[0x42; 32][..], hashes[2]];
+        let error =
+            verify_block_hashes(&listing.revision, &tampered, &[public_key(&key)]).unwrap_err();
+        assert!(is_manifest_error(&error), "{error:#}");
+        let error =
+            verify_block_hashes(&listing.revision, &hashes[..2], &[public_key(&key)]).unwrap_err();
+        assert!(is_manifest_error(&error), "a missing block: {error:#}");
+        let empty = [hashes[0], &[][..], hashes[2]];
+        let error =
+            verify_block_hashes(&listing.revision, &empty, &[public_key(&key)]).unwrap_err();
+        assert!(
+            error.downcast_ref::<DataIntegrityException>().is_some()
+                && error.to_string().contains("block #2"),
+            "{error:#}"
+        );
     }
 
     #[test]
