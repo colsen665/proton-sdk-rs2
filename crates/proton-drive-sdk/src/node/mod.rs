@@ -2399,6 +2399,7 @@ impl DtoToMetadataConverter {
         ) {
             (Some(packet), Some(signature)) if !claim.keys.is_empty() => {
                 proton_rpgp::Verifier::default()
+                    .at_date(crate::server_time::check_now())
                     .with_verification_keys(claim.keys.iter())
                     .with_verification_context(proton_rpgp::VerificationContext::new_required(
                         "drive.share-member.inviter".into(),
@@ -2484,6 +2485,7 @@ impl DtoToMetadataConverter {
         };
         let verified = !verification_keys.is_empty()
             && proton_rpgp::Verifier::default()
+                .at_date(crate::server_time::check_now())
                 .with_verification_keys(verification_keys.iter())
                 .with_verification_context(proton_rpgp::VerificationContext::new_required(
                     crate::sharing::SIGNING_MEMBER.into(),

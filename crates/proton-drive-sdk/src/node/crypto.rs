@@ -316,6 +316,7 @@ impl NodeCrypto {
                 let claim = node_authorship_claim.verification_claim([], [node_key]);
                 let verified = content_key_signature.is_some_and(|signature| {
                     proton_rpgp::Verifier::default()
+                        .at_date(crate::server_time::check_now())
                         .with_verification_keys(claim.keys.iter())
                         .verify_detached(&data.key, signature.0.as_bytes(), DataEncoding::Auto)
                         .is_ok()
@@ -504,7 +505,10 @@ impl NodeCrypto {
             .decrypt_session_key(&unarmored_buffer)
             .map_err(|e| e.to_string())?;
 
-        let mut decryptor = Decryptor::default().with_session_key(session_key.clone());
+        // Verified at server time, the time signatures are made at.
+        let mut decryptor = Decryptor::default()
+            .at_date(crate::server_time::check_now())
+            .with_session_key(session_key.clone());
 
         if let Some(sig) = detached_signature {
             decryptor = decryptor.with_external_detached_signature(

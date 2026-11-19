@@ -162,6 +162,7 @@ pub fn verify_manifest_signature(
     }
 
     proton_rpgp::Verifier::default()
+        .at_date(crate::server_time::check_now())
         .with_verification_keys(verification_keys.iter())
         .verify_detached(
             manifest,
