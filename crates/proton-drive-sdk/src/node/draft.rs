@@ -140,9 +140,30 @@ pub struct NewRevisionDraftProvider {
     pub revision_id: RevisionId,
 }
 
+/// The new file draft's `IntendedUploadSize` is rounded down to this many bytes, and
+/// left out for smaller files, as the official web client sends it: the server needs it
+/// only for an early quota check, so it learns no more of the size than that needs
+/// (`cs/client/js/src/internal/upload/apiService.ts:102-110`).
+const INTENDED_UPLOAD_SIZE_PRECISION: i64 = 100_000;
+
+/// `IntendedUploadSize` of a new file's draft, for a file of `size` bytes.
+fn new_file_intended_upload_size(size: i64) -> Option<i64> {
+    (size > INTENDED_UPLOAD_SIZE_PRECISION)
+        .then(|| size / INTENDED_UPLOAD_SIZE_PRECISION * INTENDED_UPLOAD_SIZE_PRECISION)
+}
+
+/// `IntendedUploadSize` of a new revision's draft: the size, as both official SDKs send
+/// it (C# `NewRevisionDraftProvider`, JS `createDraftRevision`); none for an empty one.
+fn new_revision_intended_upload_size(size: i64) -> Option<i64> {
+    (size > 0).then_some(size)
+}
+
 #[async_trait]
 pub trait RevisionDraftProvider: Send + Sync {
-    async fn get_draft(&self) -> anyhow::Result<RevisionDraft>;
+    /// Creates the draft for an upload of `intended_upload_size` plaintext bytes. The
+    /// size goes into the draft request as `IntendedUploadSize`, so the server can refuse
+    /// an upload over quota before its blocks are sent.
+    async fn get_draft(&self, intended_upload_size: i64) -> anyhow::Result<RevisionDraft>;
 
     /// Removes a draft that will not be committed, so a retry can reuse its name.
     async fn delete_draft(&self, draft_uid: &RevisionUid) -> anyhow::Result<()>;
@@ -181,7 +202,7 @@ async fn signing_key_for(
 
 #[async_trait]
 impl RevisionDraftProvider for NewFileDraftProvider {
-    async fn get_draft(&self) -> anyhow::Result<RevisionDraft> {
+    async fn get_draft(&self, intended_upload_size: i64) -> anyhow::Result<RevisionDraft> {
         let parent_secrets = crate::node::folder::FolderOperations::get_secrets(
             &self.client,
             self.parent_folder_uid.clone(),
@@ -235,7 +256,7 @@ impl RevisionDraftProvider for NewFileDraftProvider {
             signature_email_address: membership_address.email_address.clone(),
             // Lets the server tell this client's own stale drafts apart.
             client_uid: Some(self.client.uid().to_string()),
-            intended_upload_size: None,
+            intended_upload_size: new_file_intended_upload_size(intended_upload_size),
         };
 
         let volume_id = self.parent_folder_uid.volume_id.clone();
@@ -318,7 +339,7 @@ impl RevisionDraftProvider for NewFileDraftProvider {
 
 #[async_trait]
 impl RevisionDraftProvider for NewRevisionDraftProvider {
-    async fn get_draft(&self) -> anyhow::Result<RevisionDraft> {
+    async fn get_draft(&self, intended_upload_size: i64) -> anyhow::Result<RevisionDraft> {
         let node_secrets =
             crate::node::file::FileOperations::get_secrets(&self.client, self.node_uid.clone())
                 .await?;
@@ -333,6 +354,7 @@ impl RevisionDraftProvider for NewRevisionDraftProvider {
             let request = crate::api::revision::RevisionCreationRequest {
                 current_revision_id: Some(self.revision_id.clone()),
                 client_id: Some(self.client.uid().to_string()),
+                intended_upload_size: new_revision_intended_upload_size(intended_upload_size),
             };
             let error = match files
                 .create_revision(
@@ -497,6 +519,41 @@ mod tests {
             resolve_new_file_conflict(Some(&committed_with_draft), "me", true),
             DraftConflictResolution::Fail
         ));
+    }
+
+    #[test]
+    fn a_new_file_announces_its_size_rounded_down_to_100_kb() {
+        assert_eq!(new_file_intended_upload_size(0), None);
+        assert_eq!(new_file_intended_upload_size(100_000), None);
+        assert_eq!(new_file_intended_upload_size(100_001), Some(100_000));
+        assert_eq!(new_file_intended_upload_size(4_321_987), Some(4_300_000));
+    }
+
+    #[test]
+    fn a_new_revision_announces_its_size() {
+        assert_eq!(new_revision_intended_upload_size(0), None);
+        assert_eq!(new_revision_intended_upload_size(1), Some(1));
+        assert_eq!(
+            new_revision_intended_upload_size(4_321_987),
+            Some(4_321_987)
+        );
+    }
+
+    #[test]
+    fn draft_requests_send_the_intended_upload_size() {
+        let revision = crate::api::revision::RevisionCreationRequest {
+            current_revision_id: Some(RevisionId::new("r".into())),
+            client_id: Some("me".into()),
+            intended_upload_size: Some(4_321_987),
+        };
+        let json = serde_json::to_value(&revision).unwrap();
+        assert_eq!(json["IntendedUploadSize"], 4_321_987);
+        assert_eq!(json["CurrentRevisionID"], "r");
+        let without = crate::api::revision::RevisionCreationRequest {
+            intended_upload_size: None,
+            ..revision
+        };
+        assert!(serde_json::to_value(&without).unwrap()["IntendedUploadSize"].is_null());
     }
 
     #[test]

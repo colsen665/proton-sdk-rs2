@@ -230,7 +230,7 @@ impl FileUploader {
         thumbnails: Vec<crate::node::thumbnail::Thumbnail>,
         on_progress: Box<dyn Fn(i64, i64) + Send + Sync>,
     ) -> anyhow::Result<UploadResult> {
-        let draft = self.revision_draft_provider.get_draft().await?;
+        let draft = self.revision_draft_provider.get_draft(self.size).await?;
         let draft_uid = draft.uid.clone();
         let mut writer = match self
             .write_draft(draft, content_stream, thumbnails, on_progress)
@@ -305,6 +305,50 @@ mod tests {
 
         assert_eq!(result.revision_uid, draft_uid);
         assert_eq!(result.node_uid, NodeUid::from_parts("volume", "file-link"));
+    }
+
+    /// A draft provider that records the size it is asked for and refuses.
+    struct RecordingDraftProvider(std::sync::Arc<parking_lot::Mutex<Vec<i64>>>);
+
+    #[async_trait::async_trait]
+    impl crate::node::draft::RevisionDraftProvider for RecordingDraftProvider {
+        async fn get_draft(
+            &self,
+            intended_upload_size: i64,
+        ) -> anyhow::Result<crate::node::draft::RevisionDraft> {
+            self.0.lock().push(intended_upload_size);
+            anyhow::bail!("no draft in this test")
+        }
+
+        async fn delete_draft(&self, _: &RevisionUid) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_draft_is_asked_for_with_the_upload_size() {
+        let (client, _) = crate::test_support::client().await;
+        let sizes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let uploader = super::FileUploader::create(
+            &client,
+            Box::new(RecordingDraftProvider(sizes.clone())),
+            1_234_567,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let error = uploader
+            .upload_from_stream(
+                Box::new(tokio::io::empty()),
+                Vec::new(),
+                Box::new(|_, _| {}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no draft in this test"));
+        assert_eq!(*sizes.lock(), vec![1_234_567]);
     }
 
     #[test]

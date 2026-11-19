@@ -21,9 +21,13 @@ pub(crate) struct RecordingTelemetry(pub Mutex<Vec<(String, serde_json::Value)>>
 #[async_trait]
 impl Telemetry for RecordingTelemetry {
     async fn record_metric(&self, name: String, payload: Option<Vec<u8>>) {
-        self.0
-            .lock()
-            .push((name, serde_json::from_slice(&payload.unwrap()).unwrap()));
+        // Most metrics are JSON; `uploadError` carries the error text.
+        let payload = payload.map_or(serde_json::Value::Null, |payload| {
+            serde_json::from_slice(&payload).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&payload).into_owned())
+            })
+        });
+        self.0.lock().push((name, payload));
     }
 }
 
