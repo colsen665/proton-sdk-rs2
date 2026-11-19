@@ -65,7 +65,8 @@ pub fn create_client_with_timeout(timeout_seconds: f64) -> ClientWithMiddleware 
         .build()
         .expect("failed to build HTTP client");
 
-    crate::server_time::client_with_server_time(client)
+    // Not tied to the Drive API host, so its answers do not set the server time.
+    reqwest_middleware::ClientBuilder::new(client).build()
 }
 
 #[cfg(test)]
