@@ -50,9 +50,11 @@ impl BlockDownloader {
     /// to `output_stream`. Returns the SHA-256 digest of the encrypted blob.
     ///
     /// When `expected_hash` is non-empty and differs from the digest of the
-    /// downloaded blob, this fails with [`DataIntegrityException`] before anything
-    /// is decrypted or written. That error is not retried. An expired target is
-    /// refreshed once through the revision block listing.
+    /// downloaded blob, the block is fetched once more (a bit flip on the way); a
+    /// second mismatch fails with [`DataIntegrityException`] before anything is
+    /// decrypted or written. An expired target is refreshed once through the
+    /// revision block listing; a block the listing no longer has, or whose fresh
+    /// target is missing too, fails with [`DataIntegrityException`] as well.
     #[allow(clippy::too_many_arguments)]
     pub async fn download_verified(
         &self,
@@ -115,17 +117,36 @@ pub fn verify_block_hash(
 #[derive(Debug, PartialEq, Eq)]
 enum ErrorAction {
     Fail,
-    Retry { throttled: bool },
+    Retry {
+        throttled: bool,
+    },
     RefreshTarget,
+    /// The target was refreshed and is still not found.
+    Missing,
 }
 
-fn classify_error(error: &anyhow::Error, refreshed_target: bool) -> ErrorAction {
+/// What to do after a failed attempt. A hash mismatch is retried once
+/// (`integrity_retried` says whether it was), as the JS SDK retries any failure
+/// once for bit flips; C# retries none, but a second mismatch fails either way.
+fn classify_error(
+    error: &anyhow::Error,
+    refreshed_target: bool,
+    integrity_retried: bool,
+) -> ErrorAction {
     if error.downcast_ref::<DataIntegrityException>().is_some() {
-        return ErrorAction::Fail;
+        return if integrity_retried {
+            ErrorAction::Fail
+        } else {
+            ErrorAction::Retry { throttled: false }
+        };
     }
     if let Some(http_error) = error.downcast_ref::<crate::error::HttpTransferError>() {
-        if http_error.is_expired_target() && !refreshed_target {
-            return ErrorAction::RefreshTarget;
+        if http_error.is_expired_target() {
+            return if refreshed_target {
+                ErrorAction::Missing
+            } else {
+                ErrorAction::RefreshTarget
+            };
         }
         if !http_error.is_retryable() {
             return ErrorAction::Fail;
@@ -185,6 +206,7 @@ where
     let mut current_url = bare_url;
     let mut current_token = token;
     let mut refreshed_target = false;
+    let mut integrity_retried = false;
     let mut last_error: Option<anyhow::Error> = None;
     let mut was_throttled = false;
 
@@ -208,11 +230,21 @@ where
                 }
                 return Ok(downloaded);
             }
-            Err(error) => match classify_error(&error, refreshed_target) {
+            Err(error) => match classify_error(&error, refreshed_target, integrity_retried) {
                 ErrorAction::Fail => return Err(error),
+                // C#'s `BlockDownloader`: "File contents are incomplete".
+                ErrorAction::Missing => {
+                    return Err(DataIntegrityException::new(format!(
+                        "File contents are incomplete: block #{index} is still missing after its target was refreshed ({error})"
+                    ))
+                    .into());
+                }
                 ErrorAction::RefreshTarget => {
                     let Some((url, new_token)) = refresh().await? else {
-                        return Err(error);
+                        return Err(DataIntegrityException::new(format!(
+                            "File contents are incomplete: block #{index} is no longer listed for its revision ({error})"
+                        ))
+                        .into());
                     };
                     current_url = url;
                     current_token = new_token;
@@ -220,6 +252,10 @@ where
                     last_error = Some(error);
                 }
                 ErrorAction::Retry { throttled } => {
+                    if error.downcast_ref::<DataIntegrityException>().is_some() {
+                        log::warn!("Block #{index} failed its hash check; fetching it once more");
+                        integrity_retried = true;
+                    }
                     if throttled {
                         on_throttle(true);
                         was_throttled = true;
@@ -302,14 +338,21 @@ mod tests {
     }
 
     #[test]
-    fn data_integrity_errors_are_not_retried() {
+    fn data_integrity_errors_are_retried_once() {
         let error: anyhow::Error = DataIntegrityException::new("bad block").into();
-        assert_eq!(classify_error(&error, false), ErrorAction::Fail);
-        assert_eq!(classify_error(&error, true), ErrorAction::Fail);
+        for refreshed in [false, true] {
+            assert_eq!(
+                classify_error(&error, refreshed, false),
+                ErrorAction::Retry { throttled: false }
+            );
+            assert_eq!(classify_error(&error, refreshed, true), ErrorAction::Fail);
+        }
     }
 
+    /// R6: a hash mismatch is fetched once more (a bit flip on the way, as the JS SDK
+    /// retries it); a second mismatch is a data integrity error.
     #[tokio::test]
-    async fn digest_mismatch_fails_with_data_integrity_error_after_one_fetch() {
+    async fn digest_mismatch_fails_with_data_integrity_error_after_one_retry() {
         let fetches = AtomicUsize::new(0);
 
         let error = run(&sha256(b"other blob"), b"blob", &fetches)
@@ -320,7 +363,70 @@ mod tests {
             error.downcast_ref::<DataIntegrityException>().is_some(),
             "{error}"
         );
-        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_digest_mismatch_that_does_not_repeat_succeeds() {
+        let fetches = AtomicUsize::new(0);
+        let (bytes, _) = download_with_retries(
+            3,
+            "https://storage.test/3".into(),
+            "token".into(),
+            &sha256(b"blob"),
+            |_, _| async {
+                let first = fetches.fetch_add(1, Ordering::SeqCst) == 0;
+                Ok(if first {
+                    b"bit flip".to_vec()
+                } else {
+                    b"blob".to_vec()
+                })
+            },
+            || async { panic!("target must not be refreshed") },
+            |_| panic!("must not be throttled"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"blob");
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    fn not_found() -> anyhow::Error {
+        crate::error::HttpTransferError::new(reqwest::StatusCode::NOT_FOUND, "blob", None).into()
+    }
+
+    /// R6: a block the revision no longer lists when its expired target is refreshed,
+    /// or whose fresh target is missing too, is a data integrity error ("File contents
+    /// are incomplete", C#'s `BlockDownloader`), not the raw 404.
+    #[tokio::test]
+    async fn a_block_missing_after_the_refresh_is_a_data_integrity_error() {
+        for listed in [false, true] {
+            let fetches = AtomicUsize::new(0);
+            let refreshes = AtomicUsize::new(0);
+            let error = download_with_retries(
+                3,
+                "https://storage.test/3".into(),
+                "token".into(),
+                &sha256(b"blob"),
+                |_, _| async {
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    Err(not_found())
+                },
+                || async {
+                    refreshes.fetch_add(1, Ordering::SeqCst);
+                    Ok(listed.then(|| ("https://storage.test/3b".into(), "fresh".into())))
+                },
+                |_| panic!("must not be throttled"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.downcast_ref::<DataIntegrityException>().is_some(),
+                "listed {listed}: {error:#}"
+            );
+            assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+            assert_eq!(fetches.load(Ordering::SeqCst), if listed { 2 } else { 1 });
+        }
     }
 
     #[tokio::test]
