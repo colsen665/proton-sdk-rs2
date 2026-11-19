@@ -129,14 +129,18 @@ impl ProtonAccountClient {
         anyhow::bail!("Could not get address keys for address {address_id}")
     }
 
-    /// Returns the address's primary key as identified by its `primary_key_index` field.
+    /// Returns the address's primary key as identified by its `primary_key_index` field:
+    /// its position among the address's unlocked keys. Fails when the primary key did not
+    /// unlock, rather than returning another key.
     pub async fn get_address_primary_private_key(
         &self,
         address_id: &str,
     ) -> anyhow::Result<PrivateKey> {
         let address = self.get_address(address_id).await?;
         let keys = self.get_address_private_keys(address_id).await?;
-        let index = usize::try_from(address.primary_key_index).unwrap_or(0);
+        let index = usize::try_from(address.primary_key_index).map_err(|_| {
+            anyhow::anyhow!("The primary key of address {address_id} could not be unlocked")
+        })?;
         keys.get(index)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Address primary key index out of bounds"))
@@ -256,66 +260,22 @@ impl ProtonAccountClient {
         dto: crate::addresses::AddressDto,
         user_keys: &[PrivateKey],
     ) -> anyhow::Result<Address> {
-        let mut keys: Vec<AddressKey> = Vec::new();
-        let mut unlocked = Vec::new();
-        let mut primary_key_index: Option<i32> = None;
-
-        for key_dto in dto.keys {
-            if !key_dto.is_active {
-                continue;
-            }
-
-            let current_index = i32::try_from(keys.len()).unwrap_or(i32::MAX);
-            keys.push(AddressKey {
-                address_id: dto.id.clone(),
-                address_key_id: key_dto.id.clone(),
-                is_active: key_dto.is_active,
-                is_allowed_for_encryption: (key_dto.flags & 1) != 0,
-                is_allowed_for_verification: (key_dto.flags & 2) != 0,
-            });
-
-            if key_dto.is_primary {
-                primary_key_index = Some(current_index);
-            }
-
-            let imported = if let (Some(token), Some(signature)) =
-                (key_dto.token.as_ref(), key_dto.signature.as_ref())
-            {
-                let passphrase =
-                    Self::get_address_key_token_passphrase(token, signature, user_keys)?;
-                PrivateKey::import(
-                    key_dto.private_key.as_bytes(),
-                    passphrase.as_slice(),
-                    DataEncoding::Auto,
-                )
-            } else {
-                let passphrase = self
-                    .cache
-                    .session_secrets()
-                    .try_get_account_key_passphrase(&key_dto.id)
-                    .await?;
-
-                let Some(passphrase) = passphrase else {
-                    log::warn!("No passphrase found for address key {}", key_dto.id);
-                    continue;
-                };
-
-                PrivateKey::import(
-                    key_dto.private_key.as_bytes(),
-                    passphrase.as_slice(),
-                    DataEncoding::Auto,
-                )
-            };
-
-            match imported {
-                Ok(key) => unlocked.push(key),
-                Err(error) => {
-                    log::warn!("Failed to import address key {}: {error}", key_dto.id);
-                }
-            }
+        let mut entries = Vec::new();
+        for key_dto in dto.keys.iter().filter(|key_dto| key_dto.is_active) {
+            let unlocked = self.unlock_address_key(key_dto, user_keys).await?;
+            entries.push((key_dto, unlocked));
         }
-
-        let primary_key_index = primary_key_index.unwrap_or(0);
+        let (keys, unlocked, primary) = address_keys(&dto.id, entries);
+        let primary_key_index = match primary {
+            Some(index) => i32::try_from(index).unwrap_or(i32::MAX),
+            None => {
+                log::warn!(
+                    "The primary key of address {} is not among its unlocked keys",
+                    dto.id
+                );
+                NO_PRIMARY_KEY
+            }
+        };
 
         if !unlocked.is_empty() {
             self.cache
@@ -332,6 +292,51 @@ impl ProtonAccountClient {
             keys,
             primary_key_index,
         })
+    }
+
+    /// Unlocks an address key with its token (signed by a user key) or the passphrase
+    /// stored for it. A key that does not unlock, a token that does not decrypt or whose
+    /// signature fails included, is left out with a warning; the address's other keys
+    /// stay usable, as in the official account client.
+    async fn unlock_address_key(
+        &self,
+        key_dto: &crate::addresses::AddressKeyDto,
+        user_keys: &[PrivateKey],
+    ) -> anyhow::Result<Option<PrivateKey>> {
+        let passphrase = if let (Some(token), Some(signature)) =
+            (key_dto.token.as_ref(), key_dto.signature.as_ref())
+        {
+            match Self::get_address_key_token_passphrase(token, signature, user_keys) {
+                Ok(passphrase) => passphrase,
+                Err(error) => {
+                    log::warn!("Cannot unlock address key {}: {error}", key_dto.id);
+                    return Ok(None);
+                }
+            }
+        } else {
+            let passphrase = self
+                .cache
+                .session_secrets()
+                .try_get_account_key_passphrase(&key_dto.id)
+                .await?;
+            let Some(passphrase) = passphrase else {
+                log::warn!("No passphrase found for address key {}", key_dto.id);
+                return Ok(None);
+            };
+            passphrase
+        };
+
+        match PrivateKey::import(
+            key_dto.private_key.as_bytes(),
+            passphrase.as_slice(),
+            DataEncoding::Auto,
+        ) {
+            Ok(key) => Ok(Some(key)),
+            Err(error) => {
+                log::warn!("Failed to import address key {}: {error}", key_dto.id);
+                Ok(None)
+            }
+        }
     }
 
     fn get_address_key_token_passphrase(
@@ -365,5 +370,121 @@ impl ProtonAccountClient {
             .user
             .ok_or(anyhow::anyhow!("Unable to get user info"))?;
         Ok((user.used_space, user.max_space))
+    }
+}
+
+/// `primary_key_index` of an address whose primary key did not unlock: no key is taken
+/// for it, rather than another key in its place.
+const NO_PRIMARY_KEY: i32 = -1;
+
+/// Address key flag: the key is not compromised, so it may verify signatures
+/// (`AddressKeyCapabilities.IsAllowedForSignatureVerification` in the official account
+/// client).
+const KEY_FLAG_NOT_COMPROMISED: i32 = 1;
+/// Address key flag: the key is not obsolete, so it may be encrypted to
+/// (`AddressKeyCapabilities.IsAllowedForEncryption`).
+const KEY_FLAG_NOT_OBSOLETE: i32 = 2;
+
+/// The address's usable keys from its active key entries and their unlocked keys (`None`
+/// for one that did not unlock), as the official account client keeps them
+/// (`AddressOperations.ConvertFromDtoAsync`): only the keys that unlocked, the
+/// [`AddressKey`]s and private keys in the same order, and the index of the first primary
+/// among them. A key that does not unlock therefore never shifts the primary, and a
+/// primary that does not unlock is no primary.
+fn address_keys(
+    address_id: &str,
+    entries: Vec<(&crate::addresses::AddressKeyDto, Option<PrivateKey>)>,
+) -> (Vec<AddressKey>, Vec<PrivateKey>, Option<usize>) {
+    let mut keys = Vec::new();
+    let mut unlocked = Vec::new();
+    let mut primary = None;
+    for (key_dto, key) in entries {
+        let Some(key) = key else {
+            continue;
+        };
+        if key_dto.is_primary && primary.is_none() {
+            primary = Some(unlocked.len());
+        }
+        keys.push(AddressKey {
+            address_id: address_id.to_string(),
+            address_key_id: key_dto.id.clone(),
+            is_active: key_dto.is_active,
+            is_allowed_for_encryption: (key_dto.flags & KEY_FLAG_NOT_OBSOLETE) != 0,
+            is_allowed_for_verification: (key_dto.flags & KEY_FLAG_NOT_COMPROMISED) != 0,
+        });
+        unlocked.push(key);
+    }
+    (keys, unlocked, primary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::addresses::AddressKeyDto;
+    use proton_rpgp::AccessKeyInfo;
+
+    fn key_dto(id: &str, primary: bool, flags: i32) -> AddressKeyDto {
+        serde_json::from_value(serde_json::json!({
+            "ID": id,
+            "PrivateKey": "",
+            "Primary": primary,
+            "Active": true,
+            "Flags": flags,
+        }))
+        .unwrap()
+    }
+
+    fn private_key() -> PrivateKey {
+        proton_rpgp::KeyGenerator::default()
+            .with_user_id("test", "test@example.test")
+            .generate()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_primary_is_found_among_the_unlocked_keys() {
+        let (primary, newer) = (private_key(), private_key());
+        let primary_id = primary.key_id();
+        let dtos = [
+            key_dto("old", false, 3),
+            key_dto("primary", true, 3),
+            key_dto("newer", false, 3),
+        ];
+        // The first key does not unlock: it must not shift the primary.
+        let entries = vec![
+            (&dtos[0], None),
+            (&dtos[1], Some(primary)),
+            (&dtos[2], Some(newer)),
+        ];
+        let (keys, unlocked, index) = address_keys("address", entries);
+        let index = index.unwrap();
+        assert_eq!(unlocked[index].key_id(), primary_id);
+        assert_eq!(keys[index].address_key_id, "primary");
+        assert_eq!(keys.len(), unlocked.len());
+    }
+
+    #[test]
+    fn a_primary_that_does_not_unlock_is_no_primary() {
+        let dtos = [key_dto("primary", true, 3), key_dto("other", false, 3)];
+        let entries = vec![(&dtos[0], None), (&dtos[1], Some(private_key()))];
+        let (keys, unlocked, index) = address_keys("address", entries);
+        assert_eq!(index, None);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(unlocked.len(), 1);
+    }
+
+    #[test]
+    fn key_flags_tell_verification_and_encryption_apart() {
+        let dtos = [
+            key_dto("compromised", true, KEY_FLAG_NOT_OBSOLETE),
+            key_dto("obsolete", false, KEY_FLAG_NOT_COMPROMISED),
+        ];
+        let entries = vec![
+            (&dtos[0], Some(private_key())),
+            (&dtos[1], Some(private_key())),
+        ];
+        let (keys, _, _) = address_keys("address", entries);
+        assert!(keys[0].is_allowed_for_encryption && !keys[0].is_allowed_for_verification);
+        assert!(!keys[1].is_allowed_for_encryption && keys[1].is_allowed_for_verification);
     }
 }

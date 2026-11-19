@@ -257,18 +257,16 @@ async fn signing_key_for(
     client: &ProtonDriveClient,
     address_id: &str,
 ) -> anyhow::Result<proton_rpgp::PrivateKey> {
-    use proton_rpgp::AccessKeyInfo;
+    let address_id = crate::account::AddressId::new(address_id.to_string());
+    let primary = client
+        .account()
+        .get_address_primary_private_key(&address_id)
+        .await?;
     let keys = client
         .account()
-        .get_address_private_keys(&crate::account::AddressId::new(address_id.to_string()))
+        .get_address_private_keys(&address_id)
         .await?;
-    // Drive's commit endpoint still verifies v4 signatures; skip v6/PQC primaries.
-    if let Some(v4) = keys.iter().find(|k| k.version() < 6) {
-        return Ok(v4.clone());
-    }
-    keys.into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no address keys for {address_id}"))
+    Ok(crate::account::upload_signing_key(primary, &keys))
 }
 
 /// A new file's keys and draft request, before anything is sent.
