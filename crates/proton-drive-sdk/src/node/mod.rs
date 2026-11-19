@@ -958,7 +958,25 @@ pub enum NodeMemberRole {
 pub struct NodeMembership {
     pub role: NodeMemberRole,
     pub invite_time: DateTime<Utc>,
+    /// Who invited the user, verified by the inviter's signature of the
+    /// member key packet.
     pub shared_by: PotentialObject<Author, SignatureVerificationError>,
+    /// Which of the user's addresses accepted the invitation, verified by its
+    /// signature of the share passphrase's session key. If it is degraded, the
+    /// acceptance may be forged; the official clients warn before trusting
+    /// the shared content, and do not hide it.
+    #[serde(default = "membership_data_not_loaded")]
+    pub accepted_by: PotentialObject<Author, SignatureVerificationError>,
+}
+
+const MEMBERSHIP_DATA_NOT_LOADED: &str = "Failed to load the membership data";
+
+/// `accepted_by` of a membership cached before it was checked.
+fn membership_data_not_loaded() -> PotentialObject<Author, SignatureVerificationError> {
+    PotentialObject::Degraded(SignatureVerificationError {
+        claimed_author: None,
+        message: MEMBERSHIP_DATA_NOT_LOADED.into(),
+    })
 }
 
 impl NodeBase {
@@ -1901,7 +1919,26 @@ impl DtoToMetadataConverter {
             membership.as_ref(),
             link_details.membership.as_ref(),
         ) {
-            if let PotentialObject::Degraded(error) = &membership.shared_by {
+            for (field, author) in [
+                ("membershipInviter", &membership.shared_by),
+                ("membershipInvitee", &membership.accepted_by),
+            ] {
+                let PotentialObject::Degraded(error) = author else {
+                    continue;
+                };
+                // Shown, not refused, as the official clients do; logged once
+                // per node and field.
+                if client
+                    .integrity_reporter()
+                    .first_warning(&metric_item.uid, field)
+                {
+                    tracing::warn!(
+                        node = %metric_item.uid,
+                        field,
+                        error = %error.message,
+                        "Failed to verify the membership of a shared node"
+                    );
+                }
                 let item = crate::telemetry::MetricItem {
                     uid: metric_item.uid.clone(),
                     creation_time: Some(dto.invite_time),
@@ -1910,14 +1947,7 @@ impl DtoToMetadataConverter {
                 };
                 client
                     .integrity_reporter()
-                    .report_unchecked(
-                        client,
-                        &item,
-                        "membershipInviter",
-                        Some(&error.message),
-                        true,
-                        None,
-                    )
+                    .report_unchecked(client, &item, field, Some(&error.message), true, None)
                     .await;
             }
         }
@@ -2356,11 +2386,13 @@ impl DtoToMetadataConverter {
             return Ok((direct_role, None));
         };
 
-        let claim = crate::node::authorship::AuthorshipClaim::create(
-            account,
-            dto.inviter_email_address.as_deref(),
-        )
-        .await;
+        let (claim, accepted_by) = futures::join!(
+            crate::node::authorship::AuthorshipClaim::create(
+                account.clone(),
+                dto.inviter_email_address.as_deref(),
+            ),
+            Self::verify_membership_acceptance(account.as_ref(), dto),
+        );
         let verified = match (
             dto.member_share_passphrase_key_packet.as_ref(),
             dto.inviter_share_passphrase_key_packet_signature.as_ref(),
@@ -2396,7 +2428,317 @@ impl DtoToMetadataConverter {
                 role,
                 invite_time: dto.invite_time,
                 shared_by,
+                accepted_by,
             }),
         ))
+    }
+
+    /// Checks the member's acceptance of the invitation as the JS SDK does
+    /// (`verifyMembershipInvitee`): the member key packet is decrypted with
+    /// the keys of the accepting address (`AddressID`), and the acceptance
+    /// signature over its session key is verified with that address's public
+    /// keys in the `drive.share-member.member` context.
+    async fn verify_membership_acceptance(
+        account: &dyn crate::account::AccountClient,
+        dto: &crate::api::share::ShareMembershipSummaryDto,
+    ) -> PotentialObject<Author, SignatureVerificationError> {
+        let degraded = |claimed_author: Option<&str>, message: &str| {
+            PotentialObject::Degraded(SignatureVerificationError {
+                claimed_author: claimed_author.map(|email| crate::protobuf::Author {
+                    email_address: email.to_owned(),
+                }),
+                message: message.into(),
+            })
+        };
+        let (Some(address_id), Some(packet), Some(signature)) = (
+            dto.address_id.as_ref(),
+            dto.member_share_passphrase_key_packet.as_ref(),
+            dto.invitee_share_passphrase_session_key_signature.as_ref(),
+        ) else {
+            return degraded(None, MEMBERSHIP_DATA_NOT_LOADED);
+        };
+
+        let (email, decryption_keys) = match futures::try_join!(
+            account.get_address(address_id),
+            account.get_address_private_keys(address_id),
+        ) {
+            Ok((address, keys)) => (address.email_address, keys),
+            Err(error) => {
+                tracing::debug!(error = %error, "Failed to get the invitee's address keys");
+                return degraded(None, "Failed to get invitee keys");
+            }
+        };
+        let verification_keys = match account.get_address_public_keys(&email).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::debug!(error = %error, "Failed to get the invitee's public keys");
+                return degraded(Some(&email), "Failed to get invitee keys");
+            }
+        };
+        let Some(session_key) = decryption_keys.iter().find_map(|key| {
+            crate::pgp::PgpPrivateKey(key.clone())
+                .decrypt_session_key(packet)
+                .ok()
+        }) else {
+            return degraded(Some(&email), "Failed to verify membership");
+        };
+        let verified = !verification_keys.is_empty()
+            && proton_rpgp::Verifier::default()
+                .with_verification_keys(verification_keys.iter())
+                .with_verification_context(proton_rpgp::VerificationContext::new_required(
+                    crate::sharing::SIGNING_MEMBER.into(),
+                ))
+                .verify_detached(
+                    &session_key.key,
+                    signature.0.as_bytes(),
+                    proton_rpgp::DataEncoding::Armored,
+                )
+                .is_ok();
+        if verified {
+            PotentialObject::Node(Author {
+                email_address: Some(email),
+            })
+        } else {
+            degraded(
+                Some(&email),
+                "membership acceptance signature could not be verified",
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use crate::account::{AccountClient, AddressId};
+    use crate::api::share::ShareMembershipSummaryDto;
+    use crate::crypto::CryptoGenerator;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use proton_rpgp::{DataEncoding, PublicKey, SignatureContext, Signer};
+    use proton_sdk_rs2::protobuf::Address;
+
+    const INVITEE: &str = "invitee@example.test";
+
+    /// The member's own address `address` and the public keys of `INVITEE`.
+    struct Invitee {
+        key: PgpPrivateKey,
+        published: Vec<PublicKey>,
+        address_keys_fail: bool,
+    }
+
+    #[async_trait]
+    impl AccountClient for Invitee {
+        async fn get_address(&self, id: &AddressId) -> anyhow::Result<Address> {
+            anyhow::ensure!(id.raw() == "address", "unknown address");
+            Ok(Address {
+                address_id: id.raw().into(),
+                email_address: INVITEE.into(),
+                ..Default::default()
+            })
+        }
+
+        async fn get_default_address(&self) -> anyhow::Result<Address> {
+            unreachable!()
+        }
+
+        async fn get_address_primary_private_key(
+            &self,
+            _: &AddressId,
+        ) -> anyhow::Result<proton_rpgp::PrivateKey> {
+            unreachable!()
+        }
+
+        async fn get_address_private_keys(
+            &self,
+            id: &AddressId,
+        ) -> anyhow::Result<Vec<proton_rpgp::PrivateKey>> {
+            anyhow::ensure!(!self.address_keys_fail, "keys unavailable");
+            anyhow::ensure!(id.raw() == "address", "unknown address");
+            Ok(vec![self.key.0.clone()])
+        }
+
+        async fn get_address_public_keys(&self, email: &str) -> anyhow::Result<Vec<PublicKey>> {
+            anyhow::ensure!(email == INVITEE, "unknown email");
+            Ok(self.published.clone())
+        }
+
+        async fn get_user_keys(&self) -> anyhow::Result<Vec<proton_rpgp::PrivateKey>> {
+            unreachable!()
+        }
+
+        async fn get_user_storage_info(&self) -> anyhow::Result<(i64, i64)> {
+            unreachable!()
+        }
+    }
+
+    fn invitee() -> Invitee {
+        let key = CryptoGenerator::generate_private_key().unwrap();
+        Invitee {
+            published: vec![PublicKey::from(&key.0)],
+            key,
+            address_keys_fail: false,
+        }
+    }
+
+    /// A membership whose key packet is for `invitee`, its session key signed
+    /// by `signer` in `context` (as `accept_invitation` signs it).
+    fn membership(
+        invitee: &Invitee,
+        signer: &PgpPrivateKey,
+        context: &str,
+        address_id: Option<&str>,
+    ) -> ShareMembershipSummaryDto {
+        let session_key = CryptoGenerator::generate_session_key();
+        let packet = invitee.key.encrypt_session_key(&session_key).unwrap();
+        let signature = Signer::default()
+            .at_date(crate::server_time::check_now())
+            .with_signing_key(&signer.0)
+            .with_signature_context(SignatureContext::new(context.into(), true))
+            .sign_detached(&session_key.key, DataEncoding::Armored)
+            .unwrap();
+        serde_json::from_value(serde_json::json!({
+            "ShareID": "share",
+            "MembershipID": "membership",
+            "AddressID": address_id,
+            "Permissions": 4,
+            "InviteTime": 1_727_000_000,
+            "InviterEmail": "owner@example.test",
+            "MemberSharePassphraseKeyPacket": STANDARD.encode(packet),
+            "InviteeSharePassphraseSessionKeySignature": String::from_utf8(signature).unwrap(),
+        }))
+        .unwrap()
+    }
+
+    async fn accepted_by(
+        invitee: &Invitee,
+        dto: &ShareMembershipSummaryDto,
+    ) -> PotentialObject<Author, SignatureVerificationError> {
+        DtoToMetadataConverter::verify_membership_acceptance(invitee, dto).await
+    }
+
+    fn degraded(
+        result: PotentialObject<Author, SignatureVerificationError>,
+    ) -> (Option<String>, String) {
+        match result {
+            PotentialObject::Node(author) => panic!("verified as {author:?}"),
+            PotentialObject::Degraded(error) => (
+                error.claimed_author.map(|author| author.email_address),
+                error.message,
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_members_acceptance_verifies() {
+        let invitee = invitee();
+        let dto = membership(
+            &invitee,
+            &invitee.key,
+            crate::sharing::SIGNING_MEMBER,
+            Some("address"),
+        );
+        match accepted_by(&invitee, &dto).await {
+            PotentialObject::Node(author) => {
+                assert_eq!(author.email_address.as_deref(), Some(INVITEE));
+            }
+            PotentialObject::Degraded(error) => panic!("not verified: {}", error.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn another_key_or_context_is_degraded_with_the_claimed_member() {
+        let invitee = invitee();
+        let other = CryptoGenerator::generate_private_key().unwrap();
+        for dto in [
+            membership(
+                &invitee,
+                &other,
+                crate::sharing::SIGNING_MEMBER,
+                Some("address"),
+            ),
+            membership(
+                &invitee,
+                &invitee.key,
+                "drive.share-member.inviter",
+                Some("address"),
+            ),
+        ] {
+            assert_eq!(
+                degraded(accepted_by(&invitee, &dto).await),
+                (
+                    Some(INVITEE.to_string()),
+                    "membership acceptance signature could not be verified".to_string()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_packet_for_another_key_is_degraded() {
+        let invitee = invitee();
+        let stranger = Invitee {
+            key: CryptoGenerator::generate_private_key().unwrap(),
+            published: invitee.published.clone(),
+            address_keys_fail: false,
+        };
+        let dto = membership(
+            &stranger,
+            &invitee.key,
+            crate::sharing::SIGNING_MEMBER,
+            Some("address"),
+        );
+        assert_eq!(
+            degraded(accepted_by(&invitee, &dto).await),
+            (
+                Some(INVITEE.to_string()),
+                "Failed to verify membership".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_data_or_keys_are_degraded() {
+        let mut invitee = invitee();
+        let dto = membership(&invitee, &invitee.key, crate::sharing::SIGNING_MEMBER, None);
+        assert_eq!(
+            degraded(accepted_by(&invitee, &dto).await),
+            (None, MEMBERSHIP_DATA_NOT_LOADED.to_string())
+        );
+
+        let dto = membership(
+            &invitee,
+            &invitee.key,
+            crate::sharing::SIGNING_MEMBER,
+            Some("address"),
+        );
+        invitee.address_keys_fail = true;
+        assert_eq!(
+            degraded(accepted_by(&invitee, &dto).await),
+            (None, "Failed to get invitee keys".to_string())
+        );
+
+        invitee.address_keys_fail = false;
+        invitee.published.clear();
+        assert_eq!(
+            degraded(accepted_by(&invitee, &dto).await),
+            (
+                Some(INVITEE.to_string()),
+                "membership acceptance signature could not be verified".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_membership_cached_without_the_acceptance_reads_as_unchecked() {
+        let membership: NodeMembership = serde_json::from_value(serde_json::json!({
+            "role": "viewer",
+            "invite_time": "2024-09-22T10:13:20Z",
+            "shared_by": { "Node": { "email_address": "owner@example.test" } },
+        }))
+        .unwrap();
+        assert_eq!(
+            degraded(membership.accepted_by),
+            (None, MEMBERSHIP_DATA_NOT_LOADED.to_string())
+        );
     }
 }
