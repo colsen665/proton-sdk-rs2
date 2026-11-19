@@ -4,17 +4,29 @@
 //! clock ahead of the server produces keys from the future that the API
 //! rejects as invalid. Like upstream's `updateServerTime`, the offset is shared
 //! by every client in the process.
+//!
+//! The crypto time does not go backwards (as C#'s `CryptographyTimeProvider`,
+//! which keeps the latest `Date` seen): a change of the offset or of the device
+//! clock could otherwise date a signature before the key that makes it, which
+//! rPGP rejects. Unlike C#, the floor is bounded: it holds the time at most
+//! [`MAX_FLOOR_LEAD_SECONDS`] ahead of device time plus offset, so one answer
+//! with a far-future `Date` cannot pin the crypto time ahead for the rest of
+//! the process; the next answer with the right time brings it back.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use proton_rpgp::{CheckUnixTime, UnixTime};
 
-/// Server time minus device time, in seconds.
-static OFFSET_SECONDS: AtomicI64 = AtomicI64::new(0);
+/// The process-wide crypto clock.
+static CLOCK: CryptoClock = CryptoClock::new();
 
 /// The smallest change of the offset that a response may make.
 const MIN_OFFSET_CHANGE_SECONDS: u64 = 2;
+
+/// The furthest the floor may hold the crypto time ahead of device time plus
+/// offset. A larger step back moves the crypto time back with it.
+const MAX_FLOOR_LEAD_SECONDS: i64 = 60;
 
 fn device_now() -> i64 {
     SystemTime::now()
@@ -23,13 +35,70 @@ fn device_now() -> i64 {
         .unwrap_or_default()
 }
 
+/// Server time as the offset from the device clock, never returned earlier
+/// than the last time returned within the floor's bound.
+struct CryptoClock {
+    /// Server time minus device time, in seconds.
+    offset: AtomicI64,
+    /// The latest time returned, in Unix seconds.
+    floor: AtomicI64,
+}
+
+impl CryptoClock {
+    const fn new() -> Self {
+        Self {
+            offset: AtomicI64::new(0),
+            floor: AtomicI64::new(i64::MIN),
+        }
+    }
+
+    /// Records `server` seen at device time `device`.
+    fn update_at(&self, server: i64, device: i64) {
+        let observed = server.saturating_sub(device);
+        // Decided against the stored offset, even under concurrent updates; `Err` means kept.
+        let _ = self
+            .offset
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                adopted_offset(current, observed)
+            });
+    }
+
+    /// The crypto time at device time `device`, raising the floor to it.
+    fn now_at(&self, device: i64) -> i64 {
+        let base = device.saturating_add(self.offset.load(Ordering::Relaxed));
+        let mut time = base;
+        let previous = self
+            .floor
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |floor| {
+                time = floored(floor, base);
+                (time != floor).then_some(time)
+            });
+        if let Ok(floor) = previous
+            && time < floor
+        {
+            tracing::warn!(
+                seconds = floor.saturating_sub(time),
+                "Crypto time moved back past the floor's bound"
+            );
+        }
+        time
+    }
+}
+
 /// Records the server time reported by an API response.
 pub fn update(server_unix_seconds: i64) {
-    let observed = server_unix_seconds.saturating_sub(device_now());
-    // Decided against the stored offset, even under concurrent updates; `Err` means kept.
-    let _ = OFFSET_SECONDS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        adopted_offset(current, observed)
-    });
+    CLOCK.update_at(server_unix_seconds, device_now());
+}
+
+/// The time to return at `base` (device time plus offset) after `floor`, the
+/// latest time returned: `floor` while `base` is behind it by up to
+/// [`MAX_FLOOR_LEAD_SECONDS`], else `base`.
+fn floored(floor: i64, base: i64) -> i64 {
+    if base >= floor || floor.saturating_sub(base) > MAX_FLOOR_LEAD_SECONDS {
+        base
+    } else {
+        floor
+    }
 }
 
 /// The offset to store after observing `observed`, or `None` to keep `current`.
@@ -60,9 +129,11 @@ pub fn update_from_headers(headers: &http::HeaderMap) {
     }
 }
 
-/// The current server time in Unix seconds.
+/// The current server time in Unix seconds, never earlier than a time
+/// returned before unless the clock moved back more than
+/// [`MAX_FLOOR_LEAD_SECONDS`].
 pub fn now_unix_seconds() -> i64 {
-    device_now() + OFFSET_SECONDS.load(Ordering::Relaxed)
+    CLOCK.now_at(device_now())
 }
 
 /// The current server time, for dating new keys.
@@ -159,5 +230,77 @@ mod tests {
         let mut invalid = http::HeaderMap::new();
         invalid.insert("date", "not a date".parse().unwrap());
         assert_eq!(server_time_from_headers(&invalid), None);
+    }
+
+    const DEVICE: i64 = 1_800_000_000;
+
+    #[test]
+    fn a_smaller_offset_does_not_move_the_time_back() {
+        let clock = CryptoClock::new();
+        assert_eq!(clock.now_at(DEVICE), DEVICE);
+        // A key dated now, then an answer 5 s behind: its signature must not
+        // be dated before the key.
+        clock.update_at(DEVICE - 5, DEVICE);
+        assert_eq!(clock.now_at(DEVICE), DEVICE);
+        assert_eq!(clock.now_at(DEVICE + 3), DEVICE);
+        // Moves on once device time plus offset passes the floor.
+        assert_eq!(clock.now_at(DEVICE + 6), DEVICE + 1);
+        assert_eq!(clock.now_at(DEVICE + 7), DEVICE + 2);
+    }
+
+    #[test]
+    fn a_device_clock_stepped_back_does_not_move_the_time_back() {
+        let clock = CryptoClock::new();
+        assert_eq!(clock.now_at(DEVICE), DEVICE);
+        assert_eq!(clock.now_at(DEVICE - 30), DEVICE);
+        assert_eq!(clock.now_at(DEVICE - 29), DEVICE);
+        assert_eq!(clock.now_at(DEVICE + 1), DEVICE + 1);
+    }
+
+    #[test]
+    fn the_floor_holds_at_most_its_bound() {
+        let clock = CryptoClock::new();
+        clock.update_at(DEVICE + MAX_FLOOR_LEAD_SECONDS, DEVICE);
+        assert_eq!(clock.now_at(DEVICE), DEVICE + MAX_FLOOR_LEAD_SECONDS);
+        clock.update_at(DEVICE, DEVICE);
+        assert_eq!(clock.now_at(DEVICE), DEVICE + MAX_FLOOR_LEAD_SECONDS);
+
+        let clock = CryptoClock::new();
+        clock.update_at(DEVICE + MAX_FLOOR_LEAD_SECONDS + 1, DEVICE);
+        assert_eq!(clock.now_at(DEVICE), DEVICE + MAX_FLOOR_LEAD_SECONDS + 1);
+        clock.update_at(DEVICE, DEVICE);
+        assert_eq!(clock.now_at(DEVICE), DEVICE);
+    }
+
+    #[test]
+    fn a_far_future_answer_does_not_pin_the_time() {
+        let clock = CryptoClock::new();
+        assert_eq!(clock.now_at(DEVICE), DEVICE);
+        // One answer a year ahead dates what is made meanwhile a year ahead
+        // (as before), and the next right answer brings the time back.
+        clock.update_at(DEVICE + 365 * 86_400, DEVICE);
+        assert_eq!(clock.now_at(DEVICE), DEVICE + 365 * 86_400);
+        clock.update_at(DEVICE + 1, DEVICE + 1);
+        assert_eq!(clock.now_at(DEVICE + 1), DEVICE + 1);
+        assert_eq!(clock.now_at(DEVICE + 2), DEVICE + 2);
+
+        let clock = CryptoClock::new();
+        clock.update_at(i64::MAX, DEVICE);
+        assert_eq!(clock.now_at(DEVICE), i64::MAX);
+        clock.update_at(DEVICE, DEVICE);
+        assert_eq!(clock.now_at(DEVICE), DEVICE);
+    }
+
+    #[test]
+    fn the_floor_rule() {
+        assert_eq!(floored(i64::MIN, DEVICE), DEVICE);
+        assert_eq!(floored(DEVICE, DEVICE + 1), DEVICE + 1);
+        assert_eq!(floored(DEVICE, DEVICE - 1), DEVICE);
+        assert_eq!(floored(DEVICE, DEVICE - MAX_FLOOR_LEAD_SECONDS), DEVICE);
+        assert_eq!(
+            floored(DEVICE, DEVICE - MAX_FLOOR_LEAD_SECONDS - 1),
+            DEVICE - MAX_FLOOR_LEAD_SECONDS - 1
+        );
+        assert_eq!(floored(i64::MAX, i64::MIN), i64::MIN);
     }
 }
