@@ -286,7 +286,6 @@ pub(crate) async fn decrypt_claimed_block_sizes(
     extended_attributes: &PgpArmoredMessage,
     node_key: &PgpPrivateKey,
 ) -> anyhow::Result<Option<Vec<i32>>> {
-    use crate::api::attr::ExtendedAttributes;
     use crate::author::Author;
     use crate::node::authorship::AuthorshipClaim;
 
@@ -309,11 +308,46 @@ pub(crate) async fn decrypt_claimed_block_sizes(
         )
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
-    let xattr: ExtendedAttributes = serde_json::from_slice(&bytes)?;
-    Ok(xattr
-        .common
-        .and_then(|common| common.block_sizes)
-        .filter(|sizes| !sizes.is_empty()))
+    claimed_block_sizes(&bytes, revision.creation_time)
+}
+
+/// `Common.BlockSizes` of decrypted extended attributes, read on its own: another field
+/// that does not decode (a modification time that is not RFC 3339, say) does not hide
+/// it, and block sizes that are not positive 32-bit integers are none, with a warning.
+/// A revision created before 2025-01-01 has its sizes sorted in descending order: a
+/// Windows client wrote them unsorted then, all equal but the smaller last one, as the
+/// JS SDK's `parseBlockSizes` notes. Only text that is not JSON fails.
+pub(crate) fn claimed_block_sizes(
+    bytes: &[u8],
+    creation_time: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Option<Vec<i32>>> {
+    const SORTED_SINCE: i64 = 1_735_689_600; // 2025-01-01T00:00:00Z
+    let xattr: serde_json::Value = serde_json::from_slice(bytes)?;
+    let Some(value) = xattr
+        .get("Common")
+        .and_then(|common| common.get("BlockSizes"))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let sizes = value.as_array().and_then(|sizes| {
+        sizes
+            .iter()
+            .map(|size| {
+                size.as_i64()
+                    .filter(|size| *size > 0)
+                    .and_then(|size| i32::try_from(size).ok())
+            })
+            .collect::<Option<Vec<i32>>>()
+    });
+    let Some(mut sizes) = sizes else {
+        log::warn!("Ignoring invalid claimed block sizes");
+        return Ok(None);
+    };
+    if creation_time.timestamp() < SORTED_SINCE {
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    Ok((!sizes.is_empty()).then_some(sizes))
 }
 
 /// Reads `Common.BlockSizes` from the revision as listed by `get_revisions`.
@@ -455,6 +489,48 @@ mod tests {
     use crate::node::download::CompletedDownloadManifestVerificationException;
     use crate::node::thumbnail::ThumbnailType;
     use crate::pgp::PgpArmoredSignature;
+
+    fn at(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(seconds, 0).unwrap()
+    }
+
+    /// R2: another field that does not decode no longer hides the block sizes (the
+    /// typed decode failed on this time); invalid sizes are none.
+    #[test]
+    fn claimed_block_sizes_are_read_on_their_own() {
+        let xattr = br#"{"Common": {"ModificationTime": "last Tuesday", "Size": "8",
+            "BlockSizes": [4194304, 4]}}"#;
+        assert!(serde_json::from_slice::<crate::api::attr::ExtendedAttributes>(xattr).is_err());
+        let now = at(1_800_000_000);
+        assert_eq!(
+            claimed_block_sizes(xattr, now).unwrap(),
+            Some(vec![4_194_304, 4])
+        );
+        for invalid in [
+            &br#"{"Common": {"BlockSizes": [4194304, -4]}}"#[..],
+            br#"{"Common": {"BlockSizes": "4194304"}}"#,
+            br#"{"Common": {"BlockSizes": []}}"#,
+            br#"{"Common": {}}"#,
+            br#"{}"#,
+        ] {
+            assert_eq!(claimed_block_sizes(invalid, now).unwrap(), None);
+        }
+        assert!(claimed_block_sizes(b"not json", now).is_err());
+    }
+
+    /// R3: block sizes of a revision created before 2025 are sorted descending.
+    #[test]
+    fn claimed_block_sizes_before_2025_are_sorted() {
+        let xattr = br#"{"Common": {"BlockSizes": [392, 4194304, 4194304]}}"#;
+        assert_eq!(
+            claimed_block_sizes(xattr, at(1_735_689_599)).unwrap(),
+            Some(vec![4_194_304, 4_194_304, 392])
+        );
+        assert_eq!(
+            claimed_block_sizes(xattr, at(1_735_689_600)).unwrap(),
+            Some(vec![392, 4_194_304, 4_194_304])
+        );
+    }
 
     fn block(index: i32) -> BlockDto {
         BlockDto {
