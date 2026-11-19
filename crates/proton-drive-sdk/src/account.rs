@@ -111,3 +111,41 @@ impl AccountClient for AccountClientAdapter {
         self.client.get_user_storage_info().await
     }
 }
+
+/// The key that signs uploads, given the address's primary key and all its unlocked keys:
+/// the primary, as the official SDKs sign (C# `NewFileDraftProvider`,
+/// `NewRevisionDraftProvider`: `GetAddressPrimaryPrivateKeyAsync`). While the primary is a
+/// v6 key, the address's first v4 key instead: Drive's commit endpoint still verifies v4
+/// signatures (the upstream guard, kept until v6 primary keys are handled).
+pub(crate) fn upload_signing_key(primary: PrivateKey, keys: &[PrivateKey]) -> PrivateKey {
+    use proton_rpgp::AccessKeyInfo;
+    if primary.version() < 6 {
+        return primary;
+    }
+    keys.iter()
+        .find(|key| key.version() < 6)
+        .cloned()
+        .unwrap_or(primary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_signing_key;
+    use proton_rpgp::AccessKeyInfo;
+
+    #[test]
+    fn uploads_are_signed_with_the_primary_key() {
+        let key = || {
+            crate::crypto::CryptoGenerator::generate_private_key()
+                .unwrap()
+                .0
+        };
+        let (older, primary) = (key(), key());
+        // The address's first key is not its primary.
+        let keys = vec![older, primary.clone()];
+        assert_eq!(
+            upload_signing_key(primary.clone(), &keys).key_id(),
+            primary.key_id()
+        );
+    }
+}
