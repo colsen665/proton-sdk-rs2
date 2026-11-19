@@ -196,9 +196,12 @@ impl ProtonDriveClient {
         Self::from_http_clients(
             reqwest_middleware::ClientBuilder::new(default_api_http_client)
                 .with(crate::http::retry::DriveApiRetryMiddleware::default())
-                .with(crate::server_time::ServerTimeMiddleware)
+                .with(crate::server_time::ServerTimeMiddleware::for_api(
+                    &default_api_base_address,
+                ))
                 .build(),
-            crate::server_time::client_with_server_time(storage_api_http_client),
+            // Block storage answers do not set the server time.
+            reqwest_middleware::ClientBuilder::new(storage_api_http_client).build(),
             default_api_base_address,
             storage_api_base_address,
             Arc::new(AccountClientAdapter::new(session)) as Arc<dyn AccountClient>,
@@ -296,9 +299,12 @@ impl ProtonDriveClient {
         Self::from_http_clients(
             reqwest_middleware::ClientBuilder::new(default_api_http_client)
                 .with(crate::http::retry::DriveApiRetryMiddleware::default())
-                .with(crate::server_time::ServerTimeMiddleware)
+                .with(crate::server_time::ServerTimeMiddleware::for_api(
+                    &base_address,
+                ))
                 .build(),
-            crate::server_time::client_with_server_time(storage_api_http_client),
+            // Block storage answers do not set the server time.
+            reqwest_middleware::ClientBuilder::new(storage_api_http_client).build(),
             base_address.clone(),
             base_address,
             account_client,

@@ -912,13 +912,12 @@ impl SharingOperations {
                 crate::client::ProtonDriveDefaults::STORAGE_API_TIMEOUT_SECONDS as u64,
             ))
             .build()?;
+        // The server time comes from the account's Drive API clients only.
         let api_http = reqwest_middleware::ClientBuilder::new(http.clone())
             .with(middleware())
-            .with(crate::server_time::ServerTimeMiddleware)
             .build();
         let storage_http = reqwest_middleware::ClientBuilder::new(http)
             .with(middleware())
-            .with(crate::server_time::ServerTimeMiddleware)
             .build();
         let base_url = reqwest::Url::parse(parent.api_url())?
             .join(crate::client::ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;

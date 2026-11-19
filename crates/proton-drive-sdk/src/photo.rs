@@ -125,10 +125,11 @@ impl ProtonPhotosClient {
         )?;
         let base_url = reqwest::Url::parse(&session.client_config.base_url.to_string())?
             .join(ProtonDriveDefaults::DRIVE_BASE_ROUTE)?;
+        // The Photos API is on the Drive API host.
         let photos_api = DefaultPhotosApiClient::new(
             reqwest_middleware::ClientBuilder::new(http_client)
                 .with(crate::http::retry::DriveApiRetryMiddleware::default())
-                .with(crate::server_time::ServerTimeMiddleware)
+                .with(crate::server_time::ServerTimeMiddleware::for_api(&base_url))
                 .build(),
             base_url,
             Some(session.token_credential.clone()),
