@@ -1115,16 +1115,7 @@ impl RevisionWriter {
                 .transpose()?,
         };
 
-        self.client
-            .api()
-            .files()
-            .update_revision(
-                self.draft.uid.node_uid.volume_id.clone(),
-                self.draft.uid.node_uid.link_id.clone(),
-                self.draft.uid.revision_id.clone(),
-                request,
-            )
-            .await?;
+        seal_revision(self.client.api().files().as_ref(), &self.draft.uid, request).await?;
 
         tracing::info!(
             revision_id = %self.draft.uid.revision_id.raw(),
@@ -1132,6 +1123,69 @@ impl RevisionWriter {
         );
 
         Ok(())
+    }
+}
+
+/// "Incompatible state": the revision is no longer a draft.
+const CODE_INCOMPATIBLE_STATE: u32 = 2511;
+
+/// Commits the revision draft `uid` with `request`.
+///
+/// A commit answered 2511 succeeds when the revision is already active or
+/// obsolete, as C# does (`RegularRevisionUploadBackend.CommitAsync`): an
+/// earlier attempt went through and its answer was lost, so a retry of the
+/// same commit finds the revision sealed. A draft, or a revision that cannot
+/// be read, keeps the 2511 error.
+async fn seal_revision(
+    files: &dyn crate::api::file::FilesApiClient,
+    uid: &RevisionUid,
+    request: crate::api::revision::RevisionUpdateRequest,
+) -> anyhow::Result<()> {
+    let error = match files
+        .update_revision(
+            uid.node_uid.volume_id.clone(),
+            uid.node_uid.link_id.clone(),
+            uid.revision_id.clone(),
+            request,
+        )
+        .await
+        .and_then(|response| response.to_result())
+    {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if crate::error::ApiError::find(&error).and_then(|api| api.code)
+        != Some(CODE_INCOMPATIBLE_STATE)
+    {
+        return Err(error);
+    }
+    let state = files
+        .get_revision(
+            uid.node_uid.volume_id.clone(),
+            uid.node_uid.link_id.clone(),
+            uid.revision_id.clone(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .and_then(|response| {
+            response.base.to_result()?;
+            Ok(response.revision.revision.state)
+        });
+    match state {
+        Ok(RevisionState::Active | RevisionState::Superseded) => {
+            tracing::info!(
+                revision_id = %uid.revision_id.raw(),
+                "Revision already sealed; the commit is complete"
+            );
+            Ok(())
+        }
+        Ok(RevisionState::Draft) => Err(error),
+        Err(read_error) => {
+            tracing::debug!(error = %read_error, "Failed to read the revision after 2511");
+            Err(error)
+        }
     }
 }
 
@@ -1459,5 +1513,166 @@ mod tests {
             pairs,
             [("Location", r#"{"Latitude":1.5}"#), ("pdmount.uid", "1000")]
         );
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::{RevisionUid, seal_revision};
+    use crate::api::file::DefaultFilesApiClient;
+    use crate::api::revision::RevisionUpdateRequest;
+    use crate::error::ApiError;
+    use crate::node::NodeUid;
+    use crate::pgp::PgpArmoredSignature;
+    use crate::revision::RevisionId;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const COMMIT: &str = "PUT /drive/v2/volumes/volume/files/link/revisions/revision HTTP/1.1";
+    const READ: &str =
+        "GET /drive/v2/volumes/volume/files/link/revisions/revision?NoBlockUrls=1 HTTP/1.1";
+
+    fn revision(state: u32) -> String {
+        serde_json::json!({
+            "Code": 1000,
+            "Revision": {
+                "ID": "revision",
+                "CreateTime": 1_700_000_000,
+                "Size": 3,
+                "State": state,
+                "Blocks": [],
+            },
+        })
+        .to_string()
+    }
+
+    fn not_in_draft() -> String {
+        r#"{"Code":2511,"Error":"Revision is not in draft state"}"#.into()
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "request ended early");
+            bytes.extend_from_slice(&buffer[..count]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_string();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse().ok())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    return headers.lines().next().unwrap().to_owned();
+                }
+            }
+        }
+    }
+
+    /// Commits against a server that gives `answers` (HTTP status, body) in
+    /// turn; returns the result and the request lines it received.
+    async fn commit_with(answers: Vec<(u16, String)>) -> (anyhow::Result<()>, Vec<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest::Url::parse(&format!("http://{}/drive/", listener.local_addr().unwrap()))
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in answers {
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                        .await;
+                let Ok(accepted) = accepted else { break };
+                let (mut stream, _) = accepted.unwrap();
+                requests.push(read_request(&mut stream).await);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let files = DefaultFilesApiClient::new(
+            reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            url,
+            None,
+        );
+        let uid = RevisionUid::new(
+            NodeUid::from_parts("volume", "link"),
+            RevisionId::new("revision".into()),
+        );
+        let request = RevisionUpdateRequest {
+            manifest_signature: PgpArmoredSignature("signature".into()),
+            signature_email_address: "user@example.test".into(),
+            checksum_verified: true,
+            extended_attributes: None,
+            photos_attributes: None,
+        };
+        let result = seal_revision(&files, &uid, request).await;
+        (result, server.await.unwrap())
+    }
+
+    fn code(result: anyhow::Result<()>) -> Option<u32> {
+        ApiError::find(&result.unwrap_err()).and_then(|error| error.code)
+    }
+
+    #[tokio::test]
+    async fn not_in_draft_succeeds_when_the_revision_is_active_or_obsolete() {
+        for state in [1, 2] {
+            let (result, requests) =
+                commit_with(vec![(422, not_in_draft()), (200, revision(state))]).await;
+            result.unwrap();
+            assert_eq!(requests, [COMMIT, READ]);
+        }
+    }
+
+    #[tokio::test]
+    async fn not_in_draft_in_a_2xx_answer_is_checked_too() {
+        let (result, requests) = commit_with(vec![(200, not_in_draft()), (200, revision(1))]).await;
+        result.unwrap();
+        assert_eq!(requests, [COMMIT, READ]);
+    }
+
+    #[tokio::test]
+    async fn not_in_draft_fails_when_the_revision_is_a_draft_or_unreadable() {
+        let (result, requests) = commit_with(vec![(422, not_in_draft()), (200, revision(0))]).await;
+        assert_eq!(code(result), Some(2511));
+        assert_eq!(requests, [COMMIT, READ]);
+
+        let (result, requests) = commit_with(vec![
+            (422, not_in_draft()),
+            (422, r#"{"Code":2501,"Error":"gone"}"#.into()),
+        ])
+        .await;
+        assert_eq!(code(result), Some(2511));
+        assert_eq!(requests, [COMMIT, READ]);
+    }
+
+    #[tokio::test]
+    async fn other_answers_need_no_read() {
+        let (result, requests) =
+            commit_with(vec![(200, r#"{"Code":1000}"#.into()), (200, revision(1))]).await;
+        result.unwrap();
+        assert_eq!(requests, [COMMIT]);
+
+        let (result, requests) = commit_with(vec![
+            (422, r#"{"Code":2500,"Error":"exists"}"#.into()),
+            (200, revision(1)),
+        ])
+        .await;
+        assert_eq!(code(result), Some(2500));
+        assert_eq!(requests, [COMMIT]);
+
+        let (result, requests) = commit_with(vec![
+            (200, r#"{"Code":2000,"Error":"invalid"}"#.into()),
+            (200, revision(1)),
+        ])
+        .await;
+        assert_eq!(code(result), Some(2000));
+        assert_eq!(requests, [COMMIT]);
     }
 }
