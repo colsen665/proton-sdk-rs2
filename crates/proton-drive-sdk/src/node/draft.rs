@@ -165,8 +165,79 @@ pub trait RevisionDraftProvider: Send + Sync {
     /// an upload over quota before its blocks are sent.
     async fn get_draft(&self, intended_upload_size: i64) -> anyhow::Result<RevisionDraft>;
 
+    /// The keys and target of a small upload (one request instead of a draft, its blocks
+    /// and a commit), when this provider supports one; nothing is sent to create it.
+    /// `None` when it does not, or cannot now: the upload then takes the draft path.
+    async fn get_small_upload(&self) -> anyhow::Result<Option<SmallUpload>> {
+        Ok(None)
+    }
+
     /// Removes a draft that will not be committed, so a retry can reuse its name.
     async fn delete_draft(&self, draft_uid: &RevisionUid) -> anyhow::Result<()>;
+}
+
+/// A small upload refused as a conflict (code 2500 or HTTP 409) fails with the error a
+/// draft would: [`NodeWithSameNameExistsError`] for a new file,
+/// [`RevisionDraftConflictError`] for a revision, as C#'s `SmallRevisionUploadBackend`
+/// maps it. The server committed nothing, so the uploader falls back to the draft path.
+pub(crate) fn small_upload_conflict(error: anyhow::Error, new_file: bool) -> anyhow::Error {
+    let Some((source, conflict)) = draft_conflict(&error) else {
+        return error;
+    };
+    if new_file {
+        NodeWithSameNameExistsError { conflict, source }.into()
+    } else {
+        RevisionDraftConflictError { conflict, source }.into()
+    }
+}
+
+/// Length of a small upload's verification code: the last bytes of the content key
+/// packet (C# `SmallFileUploadBlockVerifier`, JS `SmallFileBlockVerifier`).
+pub(crate) const SMALL_UPLOAD_VERIFICATION_CODE_LENGTH: usize = 32;
+
+/// What a small upload needs in place of a draft.
+pub struct SmallUpload {
+    pub file_key: PgpPrivateKey,
+    pub content_key: PgpSessionKey,
+    pub signing_key: PgpPrivateKey,
+    pub membership_address: Address,
+    /// The file's content key packet; its last 32 bytes are the verification code.
+    pub content_key_packet: Vec<u8>,
+    pub target: SmallUploadTarget,
+}
+
+impl SmallUpload {
+    /// The verifier of the content block: the content key packet decrypted with the file
+    /// key, and the packet's last 32 bytes as the verification code.
+    pub fn block_verifier(&self) -> anyhow::Result<BlockVerifier> {
+        let session_key = self
+            .file_key
+            .decrypt_session_key(&self.content_key_packet)
+            .map_err(|e| anyhow::anyhow!("Node key and session key mismatch: {}", e))?;
+        let code_start = self
+            .content_key_packet
+            .len()
+            .checked_sub(SMALL_UPLOAD_VERIFICATION_CODE_LENGTH)
+            .ok_or_else(|| anyhow::anyhow!("Content key packet too short"))?;
+        Ok(BlockVerifier::new(
+            session_key,
+            self.content_key_packet[code_start..].to_vec(),
+        ))
+    }
+}
+
+/// Where a small upload goes.
+pub enum SmallUploadTarget {
+    /// A new file: the draft request it replaces, sent as the small upload's metadata.
+    NewFile {
+        volume_id: VolumeId,
+        request: Box<crate::api::file::FileCreationRequest>,
+    },
+    /// A new revision of `node_uid`, replacing `current_revision_id`.
+    Revision {
+        node_uid: NodeUid,
+        current_revision_id: RevisionId,
+    },
 }
 
 async fn membership_address_for(
@@ -200,9 +271,19 @@ async fn signing_key_for(
         .ok_or_else(|| anyhow::anyhow!("no address keys for {address_id}"))
 }
 
-#[async_trait]
-impl RevisionDraftProvider for NewFileDraftProvider {
-    async fn get_draft(&self, intended_upload_size: i64) -> anyhow::Result<RevisionDraft> {
+/// A new file's keys and draft request, before anything is sent.
+struct PreparedNewFile {
+    request: crate::api::file::FileCreationRequest,
+    node_key: PgpPrivateKey,
+    content_key: PgpSessionKey,
+    signing_key: PgpPrivateKey,
+    hash_key: Vec<u8>,
+    membership_address: Address,
+}
+
+impl NewFileDraftProvider {
+    /// Generates the new file's keys and builds its draft request.
+    async fn prepare(&self, intended_upload_size: i64) -> anyhow::Result<PreparedNewFile> {
         let parent_secrets = crate::node::folder::FolderOperations::get_secrets(
             &self.client,
             self.parent_folder_uid.clone(),
@@ -259,6 +340,29 @@ impl RevisionDraftProvider for NewFileDraftProvider {
             intended_upload_size: new_file_intended_upload_size(intended_upload_size),
         };
 
+        Ok(PreparedNewFile {
+            request,
+            node_key,
+            content_key,
+            signing_key: PgpPrivateKey(signing_key),
+            hash_key: parent_secrets.hash_key,
+            membership_address,
+        })
+    }
+}
+
+#[async_trait]
+impl RevisionDraftProvider for NewFileDraftProvider {
+    async fn get_draft(&self, intended_upload_size: i64) -> anyhow::Result<RevisionDraft> {
+        let PreparedNewFile {
+            request,
+            node_key,
+            content_key,
+            signing_key,
+            hash_key,
+            membership_address,
+        } = self.prepare(intended_upload_size).await?;
+
         let volume_id = self.parent_folder_uid.volume_id.clone();
         let mut attempts_left = MAX_DRAFT_CREATION_ATTEMPTS;
         let response = loop {
@@ -304,21 +408,40 @@ impl RevisionDraftProvider for NewFileDraftProvider {
         let block_verifier = self
             .client
             .block_verifier_factory()
-            .create(
-                draft_revision_uid.clone(),
-                &PgpPrivateKey(node_key.0.clone()),
-            )
+            .create(draft_revision_uid.clone(), &node_key)
             .await?;
 
         Ok(RevisionDraft {
             uid: draft_revision_uid,
-            file_key: PgpPrivateKey(node_key.0),
+            file_key: node_key,
             content_key,
-            signing_key: PgpPrivateKey(signing_key),
-            hash_key: Some(parent_secrets.hash_key),
+            signing_key,
+            hash_key: Some(hash_key),
             membership_address,
             block_verifier,
         })
+    }
+
+    async fn get_small_upload(&self) -> anyhow::Result<Option<SmallUpload>> {
+        let PreparedNewFile {
+            request,
+            node_key,
+            content_key,
+            signing_key,
+            membership_address,
+            ..
+        } = self.prepare(0).await?;
+        Ok(Some(SmallUpload {
+            content_key_packet: request.content_key_packet.clone(),
+            file_key: node_key,
+            content_key,
+            signing_key,
+            membership_address,
+            target: SmallUploadTarget::NewFile {
+                volume_id: self.parent_folder_uid.volume_id.clone(),
+                request: Box::new(request),
+            },
+        }))
     }
 
     async fn delete_draft(&self, draft_uid: &RevisionUid) -> anyhow::Result<()> {
@@ -411,6 +534,57 @@ impl RevisionDraftProvider for NewRevisionDraftProvider {
             membership_address,
             block_verifier,
         })
+    }
+
+    /// A small revision needs the file's content key packet, read fresh: its verification
+    /// code is the packet's last 32 bytes. When it cannot be read, the upload takes the
+    /// draft path, as in C# (`RevisionUploadBackendFactory.TryGetContentKeyPacketAsync`).
+    async fn get_small_upload(&self) -> anyhow::Result<Option<SmallUpload>> {
+        let details = self
+            .client
+            .api()
+            .links()
+            .get_details(
+                self.node_uid.volume_id.clone(),
+                vec![self.node_uid.link_id.clone()],
+            )
+            .await;
+        let content_key_packet = match details {
+            Ok(response) => response
+                .links
+                .into_iter()
+                .next()
+                .and_then(|link| link.file)
+                .map(|file| file.content_key_packet)
+                .filter(|packet| packet.len() >= SMALL_UPLOAD_VERIFICATION_CODE_LENGTH),
+            Err(error) => {
+                tracing::warn!(
+                    "Could not read the content key packet for a small revision: {error:#}"
+                );
+                None
+            }
+        };
+        let Some(content_key_packet) = content_key_packet else {
+            tracing::warn!("No content key packet for a small revision; using a draft");
+            return Ok(None);
+        };
+
+        let node_secrets =
+            crate::node::file::FileOperations::get_secrets(&self.client, self.node_uid.clone())
+                .await?;
+        let membership_address = membership_address_for(&self.client, &self.node_uid).await?;
+        let signing_key = signing_key_for(&self.client, &membership_address.address_id).await?;
+        Ok(Some(SmallUpload {
+            file_key: node_secrets.base.key,
+            content_key: node_secrets.content_key,
+            signing_key: PgpPrivateKey(signing_key),
+            membership_address,
+            content_key_packet,
+            target: SmallUploadTarget::Revision {
+                node_uid: self.node_uid.clone(),
+                current_revision_id: self.revision_id.clone(),
+            },
+        }))
     }
 
     async fn delete_draft(&self, draft_uid: &RevisionUid) -> anyhow::Result<()> {

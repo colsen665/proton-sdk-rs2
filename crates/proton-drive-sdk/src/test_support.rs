@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use proton_sdk_rs2::cache::InMemoryCacheRepository;
-use proton_sdk_rs2::client::{AlwaysDisabledFeatureFlagProvider, Telemetry};
+use proton_sdk_rs2::client::{AlwaysDisabledFeatureFlagProvider, FeatureFlagProvider, Telemetry};
 use proton_sdk_rs2::protobuf::Address;
 
 use crate::account::{AccountClient, AddressId};
@@ -76,6 +76,53 @@ impl AccountClient for TestAccount {
     async fn get_user_storage_info(&self) -> anyhow::Result<(i64, i64)> {
         panic!("unexpected quota lookup")
     }
+}
+
+/// Answers every feature flag with the same value.
+pub(crate) struct FixedFeatureFlags(pub bool);
+
+#[async_trait]
+impl FeatureFlagProvider for FixedFeatureFlags {
+    async fn is_enabled(&self, _flag_name: String) -> anyhow::Result<bool> {
+        Ok(self.0)
+    }
+}
+
+/// A client whose Drive API is at `api_url` (a local test server), with the
+/// given feature flags.
+pub(crate) fn client_at(
+    api_url: reqwest::Url,
+    feature_flags: Arc<dyn FeatureFlagProvider>,
+) -> ProtonDriveClient {
+    let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+    let api = crate::api::DriveApiClientsFactory::create(
+        &DefaultDriveApiClientsFactory,
+        http.clone(),
+        http.clone(),
+        api_url.clone(),
+        api_url.clone(),
+        None,
+    );
+    let cache = Arc::new(crate::cache::client::DefaultDriveClientCache::new(
+        Arc::new(DefaultDriveEntityCache::new(Arc::new(
+            InMemoryCacheRepository::new(),
+        ))),
+        Arc::new(DefaultDriveSecretCache::new(Arc::new(
+            InMemoryCacheRepository::new(),
+        ))),
+    ));
+    ProtonDriveClient::from_components(
+        Arc::new(TestAccount),
+        api,
+        cache,
+        Arc::new(crate::block::verify::DefaultBlockVerifierFactory::new(
+            http, api_url, None,
+        )),
+        feature_flags,
+        Arc::new(RecordingTelemetry::default()),
+        "test-client".into(),
+        None,
+    )
 }
 
 pub(crate) async fn client() -> (ProtonDriveClient, Arc<RecordingTelemetry>) {

@@ -11,7 +11,7 @@ use crate::node::download::DownloadState;
 use crate::node::draft::RevisionDraft;
 use crate::node::file::FileContentDigests;
 use crate::node::photo::PhotoUploadContext;
-use crate::pgp::PgpArmoredMessage;
+use crate::pgp::{PgpArmoredMessage, PgpPrivateKey, PgpSessionKey};
 use crate::protobuf::SignatureVerificationError;
 use crate::protobuf::ThumbnailHeader;
 use crate::revision::RevisionId;
@@ -327,6 +327,73 @@ impl Revision {
             claimed_block_sizes: claimed.block_sizes,
         }
     }
+}
+
+/// What a revision's extended attributes state about its content.
+pub(crate) struct ContentAttributes<'a> {
+    pub size: i64,
+    pub modification_time: Option<DateTime<Utc>>,
+    pub block_sizes: Vec<i32>,
+    pub sha1: Vec<u8>,
+    pub media_info: Option<crate::api::attr::MediaExtendedAttributes>,
+    pub additional_metadata: Option<&'a [AdditionalMetadataProperty]>,
+}
+
+/// The revision's extended attributes (`XAttr`), encrypted to the file key and signed.
+pub(crate) fn encrypt_extended_attributes(
+    file_key: &PgpPrivateKey,
+    signing_key: &PgpPrivateKey,
+    attributes: ContentAttributes<'_>,
+) -> anyhow::Result<PgpArmoredMessage> {
+    let additional_metadata = attributes
+        .additional_metadata
+        .unwrap_or_default()
+        .iter()
+        .map(|prop| {
+            (
+                prop.key.clone(),
+                serde_json::Value::String(prop.value.clone()),
+            )
+        })
+        .collect();
+
+    let xattr = crate::api::attr::ExtendedAttributes {
+        common: Some(crate::api::attr::CommonExtendedAttributes {
+            size: Some(attributes.size),
+            modification_time: attributes.modification_time,
+            block_sizes: Some(attributes.block_sizes),
+            digests: Some(crate::api::file::FileContentDigestsDto {
+                sha1: Some(attributes.sha1),
+            }),
+        }),
+        media: attributes.media_info,
+        additional_metadata,
+    };
+
+    let xattr_json = serde_json::to_vec(&xattr)?;
+
+    let xattr_encryptor = Encryptor::default()
+        .at_date(crate::server_time::check_now())
+        .with_encryption_key(file_key.0.as_public_key())
+        .with_signing_key(&signing_key.0);
+    let xattr_result = xattr_encryptor.encrypt(&xattr_json)?;
+    Ok(PgpArmoredMessage(String::from_utf8(xattr_result.armor()?)?))
+}
+
+/// A thumbnail encrypted with the content key and signed, and the SHA-256 of the
+/// encrypted bytes.
+pub(crate) fn encrypt_thumbnail(
+    content_key: &PgpSessionKey,
+    signing_key: &PgpPrivateKey,
+    content: &[u8],
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let encryptor = Encryptor::default()
+        .at_date(crate::server_time::check_now())
+        .with_session_key(content_key.to_rpgp_sk()?)
+        .with_signing_key(&signing_key.0);
+    let encrypted_data = encryptor.encrypt(content)?.to_bytes()?;
+    let hash_digest = Sha256::digest(&encrypted_data).to_vec();
+    Ok((encrypted_data, hash_digest))
 }
 
 pub struct RevisionOperations;
@@ -778,20 +845,12 @@ impl RevisionWriter {
         let mut requests = Vec::new();
         let mut encrypted_thumbnails = Vec::new();
 
-        let sk = self.draft.content_key.to_rpgp_sk()?;
-
         for thumb in thumbnails {
-            let encryptor = Encryptor::default()
-                .at_date(crate::server_time::check_now())
-                .with_session_key(sk.clone())
-                .with_signing_key(&self.draft.signing_key.0);
-
-            let result = encryptor.encrypt(&thumb.content)?;
-            let encrypted_data = result.to_bytes()?;
-
-            let mut hasher = Sha256::new();
-            hasher.update(&encrypted_data);
-            let hash_digest = hasher.finalize().to_vec();
+            let (encrypted_data, hash_digest) = encrypt_thumbnail(
+                &self.draft.content_key,
+                &self.draft.signing_key,
+                &thumb.content,
+            )?;
 
             requests.push(ThumbnailCreationRequest {
                 size: encrypted_data.len() as i32,
@@ -913,37 +972,18 @@ impl RevisionWriter {
         } else {
             false
         };
-        let mut additional_metadata = std::collections::HashMap::new();
-        if let Some(meta) = &self.additional_metadata {
-            for prop in meta {
-                additional_metadata.insert(
-                    prop.key.clone(),
-                    serde_json::Value::String(prop.value.clone()),
-                );
-            }
-        }
-
-        let xattr = crate::api::attr::ExtendedAttributes {
-            common: Some(crate::api::attr::CommonExtendedAttributes {
-                size: Some(self.total_written),
+        let encrypted_xattr = encrypt_extended_attributes(
+            &self.draft.file_key,
+            &self.draft.signing_key,
+            ContentAttributes {
+                size: self.total_written,
                 modification_time: self.last_modification_time,
-                block_sizes: Some(self.block_sizes.clone()),
-                digests: Some(crate::api::file::FileContentDigestsDto {
-                    sha1: Some(sha1_digest.clone()),
-                }),
-            }),
-            media: self.media_info.clone(),
-            additional_metadata,
-        };
-
-        let xattr_json = serde_json::to_vec(&xattr)?;
-
-        let xattr_encryptor = Encryptor::default()
-            .at_date(crate::server_time::check_now())
-            .with_encryption_key(self.draft.file_key.0.as_public_key())
-            .with_signing_key(&self.draft.signing_key.0);
-        let xattr_result = xattr_encryptor.encrypt(&xattr_json)?;
-        let encrypted_xattr = PgpArmoredMessage(String::from_utf8(xattr_result.armor()?)?);
+                block_sizes: self.block_sizes.clone(),
+                sha1: sha1_digest.clone(),
+                media_info: self.media_info.clone(),
+                additional_metadata: self.additional_metadata.as_deref(),
+            },
+        )?;
 
         let request = crate::api::revision::RevisionUpdateRequest {
             manifest_signature,

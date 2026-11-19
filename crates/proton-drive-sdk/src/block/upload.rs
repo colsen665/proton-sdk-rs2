@@ -1,7 +1,7 @@
 use crate::block::verify::BlockVerifier;
 use crate::client::ProtonDriveClient;
 use crate::node::draft::RevisionDraft;
-use crate::pgp::PgpArmoredMessage;
+use crate::pgp::{PgpArmoredMessage, PgpPrivateKey, PgpSessionKey};
 use proton_rpgp::{AsPublicKeyRef, pgp::ser::Serialize};
 use sha2::Digest;
 
@@ -31,24 +31,56 @@ struct BlockCiphertext {
     encrypted_signature: PgpArmoredMessage,
 }
 
-/// Signs `plain_data` with the draft's signing key, encrypts the signature to the
-/// file key and the data with the content key.
-fn encrypt_content(draft: &RevisionDraft, plain_data: &[u8]) -> anyhow::Result<BlockCiphertext> {
+/// The keys a content block is signed and encrypted with.
+pub(crate) struct BlockKeys<'a> {
+    /// The file's node key: the block's signature is encrypted to it.
+    pub file_key: &'a PgpPrivateKey,
+    /// The file's content key: the block is encrypted with it.
+    pub content_key: &'a PgpSessionKey,
+    /// The address key the block is signed with.
+    pub signing_key: &'a PgpPrivateKey,
+}
+
+impl<'a> From<&'a RevisionDraft> for BlockKeys<'a> {
+    fn from(draft: &'a RevisionDraft) -> Self {
+        Self {
+            file_key: &draft.file_key,
+            content_key: &draft.content_key,
+            signing_key: &draft.signing_key,
+        }
+    }
+}
+
+/// Encrypts and verifies the one content block of a small upload, which has no draft:
+/// [`BlockUploader::encrypt_block`] without the draft.
+pub(crate) fn encrypt_small_upload_block(
+    keys: BlockKeys<'_>,
+    verifier: &BlockVerifier,
+    plain_data: &[u8],
+) -> anyhow::Result<EncryptedBlock> {
+    encrypt_and_verify(1, plain_data, verifier, || {
+        encrypt_content(&keys, plain_data)
+    })
+}
+
+/// Signs `plain_data` with the signing key, encrypts the signature to the file key and
+/// the data with the content key.
+fn encrypt_content(keys: &BlockKeys<'_>, plain_data: &[u8]) -> anyhow::Result<BlockCiphertext> {
     // 1. Sign the plain data
     let signer = proton_rpgp::Signer::default()
         .at_date(crate::server_time::check_now())
-        .with_signing_key(&draft.signing_key.0);
+        .with_signing_key(&keys.signing_key.0);
     let signature = signer.sign_detached(plain_data, proton_rpgp::DataEncoding::Auto)?;
 
     // 2. Encrypt the signature using the file key (unsigned, matching official SDK)
     let signature_encryptor = proton_rpgp::Encryptor::default()
         .at_date(crate::server_time::check_now())
-        .with_encryption_key(draft.file_key.0.as_public_key());
+        .with_encryption_key(keys.file_key.0.as_public_key());
     let signature_result = signature_encryptor.encrypt(&signature)?;
     let encrypted_signature = PgpArmoredMessage(String::from_utf8(signature_result.armor()?)?);
 
     // 3. Encrypt the content using the session key
-    let sk = draft.content_key.to_rpgp_sk()?;
+    let sk = keys.content_key.to_rpgp_sk()?;
     let content_encryptor = proton_rpgp::Encryptor::default()
         .at_date(crate::server_time::check_now())
         .with_session_key(sk);
@@ -139,7 +171,7 @@ impl BlockUploader {
     ) -> anyhow::Result<EncryptedBlock> {
         tracing::debug!(block_number, size = plain_data.len(), "Encrypting block");
         encrypt_and_verify(block_number, plain_data, &draft.block_verifier, || {
-            encrypt_content(draft, plain_data)
+            encrypt_content(&BlockKeys::from(draft), plain_data)
         })
     }
 
@@ -224,7 +256,7 @@ impl BlockUploader {
             verification_token,
             ..
         } = encrypt_and_verify(block_number, plain_data, &draft.block_verifier, || {
-            encrypt_content(draft, plain_data)
+            encrypt_content(&BlockKeys::from(draft), plain_data)
         })?;
 
         // 2. Prepare Block Upload
