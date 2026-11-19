@@ -348,6 +348,9 @@ impl ProtonDriveClient {
         block_transfer_degree_of_parallelism: Option<usize>,
         api_url: String,
     ) -> Self {
+        // The account client verifies address key tokens at server time too.
+        proton_sdk_rs2::crypto_time::set_source(crate::server_time::check_now);
+
         let max_degree_of_block_transfer_parallelism =
             block_transfer_degree_of_parallelism.unwrap_or_else(default_block_transfer_parallelism);
 

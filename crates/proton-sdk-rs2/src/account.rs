@@ -349,6 +349,7 @@ impl ProtonAccountClient {
         }
 
         let decrypted = Decryptor::default()
+            .at_date(crate::crypto_time::check_now())
             .with_decryption_keys(user_keys.iter())
             .with_verification_keys(user_keys.iter().map(|key| key.as_public_key()))
             .with_external_detached_signature(ExternalDetachedSignature::new_unencrypted(
@@ -439,6 +440,53 @@ mod tests {
             .with_user_id("test", "test@example.test")
             .generate()
             .unwrap()
+    }
+
+    fn device_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// The only test that installs a crypto time source in this process.
+    #[test]
+    fn a_token_signed_at_server_time_verifies_at_the_installed_clock() {
+        let user_key = private_key();
+        let passphrase = b"address key passphrase";
+        let token = proton_rpgp::Encryptor::default()
+            .with_encryption_key(user_key.as_public_key())
+            .encrypt(passphrase)
+            .unwrap()
+            .armor()
+            .unwrap();
+        let token = String::from_utf8(token).unwrap();
+        let signed_at = |seconds: u64| {
+            let bytes = proton_rpgp::Signer::default()
+                .at_date(proton_rpgp::CheckUnixTime::new(seconds))
+                .with_signing_key(&user_key)
+                .sign_detached(passphrase, DataEncoding::Armored)
+                .unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        let keys = [user_key.clone()];
+        // Signed by a client whose (server) time is an hour ahead of this device.
+        let ahead = signed_at(device_now() + 3_600);
+        assert!(
+            ProtonAccountClient::get_address_key_token_passphrase(&token, &ahead, &keys).is_err(),
+            "at the device clock, a signature an hour ahead is in the future"
+        );
+
+        crate::crypto_time::set_source(|| proton_rpgp::CheckUnixTime::new(device_now() + 3_600));
+        assert_eq!(
+            ProtonAccountClient::get_address_key_token_passphrase(&token, &ahead, &keys).unwrap(),
+            passphrase
+        );
+        let later = signed_at(device_now() + 7_200);
+        assert!(
+            ProtonAccountClient::get_address_key_token_passphrase(&token, &later, &keys).is_err(),
+            "a signature dated after the installed clock still fails"
+        );
     }
 
     #[test]
